@@ -60,7 +60,7 @@ def lambda_handler(event, context):
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT u.user_id, u.email, u.name, u.phone FROM firm_os.org_users u "
+            "SELECT u.user_id, u.email, u.name FROM firm_os.org_users u "
             "WHERE u.org_id = %s AND u.escalation_routing = TRUE",
             (org_id,)
         )
