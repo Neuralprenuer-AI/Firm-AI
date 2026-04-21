@@ -36,8 +36,12 @@ def _resp(status, body):
 def lambda_handler(event, context):
     try:
         claims = _auth(event)
-    except (PermissionError, Exception) as e:
+    except PermissionError as e:
         return _resp(401, {'error': str(e)})
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("crud unhandled error: %s", type(e).__name__)
+        return _resp(500, {'error': 'internal server error'})
 
     role = get_role(claims)
     caller_org_id = get_org_id(claims)
@@ -173,11 +177,17 @@ def lambda_handler(event, context):
             )
             row = cur.fetchone()
         conn.commit()
+        log_audit(conn, str(row['org_id']), claims.get('sub', 'system'), 'escalation.updated', updates)
         return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
 
     # GET /firmos/dashboard/stats
     if path == '/firmos/dashboard/stats' and method == 'GET':
-        org_id = caller_org_id
+        if role == 'super_admin':
+            org_id = (event.get('queryStringParameters') or {}).get('org_id')
+            if not org_id:
+                return _resp(400, {'error': 'org_id required for super_admin'})
+        else:
+            org_id = caller_org_id
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM firm_os.messages WHERE org_id = %s AND direction = 'outbound' AND created_at >= CURRENT_DATE",
@@ -228,6 +238,13 @@ def lambda_handler(event, context):
     if path == '/firmos/team' and method == 'POST':
         if role not in ('super_admin', 'firm_admin'):
             return _resp(403, {'error': 'forbidden'})
+        required_team_fields = ['name', 'email']
+        missing = [f for f in required_team_fields if not body.get(f)]
+        if missing:
+            return _resp(400, {'error': f'missing required fields: {missing}'})
+        valid_roles = {'partner', 'associate', 'paralegal', 'admin'}
+        if body.get('org_role') and body['org_role'] not in valid_roles:
+            return _resp(400, {'error': f'invalid org_role, must be one of: {sorted(valid_roles)}'})
         org_id = caller_org_id
         with conn.cursor() as cur:
             cur.execute(
@@ -238,6 +255,7 @@ def lambda_handler(event, context):
             )
             row = cur.fetchone()
         conn.commit()
+        log_audit(conn, org_id, claims.get('sub', 'system'), 'team.member_added', {'email': body['email'], 'org_role': body.get('org_role', 'associate')})
         return _resp(201, dict(row))
 
     # DELETE /firmos/team/{user_id}
@@ -251,13 +269,20 @@ def lambda_handler(event, context):
             )
             row = cur.fetchone()
         conn.commit()
+        if row:
+            log_audit(conn, caller_org_id, claims.get('sub', 'system'), 'team.member_removed', {'user_id': params['user_id']})
         return _resp(200, {'deleted': True}) if row else _resp(404, {'error': 'not found'})
 
     # PATCH /firmos/settings
     if path == '/firmos/settings' and method == 'PATCH':
         if role not in ('super_admin', 'firm_admin'):
             return _resp(403, {'error': 'forbidden'})
-        org_id = caller_org_id
+        if role == 'super_admin':
+            org_id = body.get('org_id') or (event.get('queryStringParameters') or {}).get('org_id')
+            if not org_id:
+                return _resp(400, {'error': 'org_id required for super_admin'})
+        else:
+            org_id = caller_org_id
         allowed = {'monthly_sms_budget', 'after_hours_en', 'after_hours_es', 'timezone', 'default_language'}
         updates = {k: v for k, v in body.items() if k in allowed}
         if not updates:
@@ -271,6 +296,7 @@ def lambda_handler(event, context):
             )
             row = cur.fetchone()
         conn.commit()
+        log_audit(conn, org_id, claims.get('sub', 'system'), 'org.settings_updated', updates)
         return _resp(200, dict(row))
 
     # GET /firmos/audit
