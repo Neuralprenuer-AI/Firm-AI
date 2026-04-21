@@ -9,7 +9,11 @@ def lambda_handler(event, context):
     try:
         claims = auth_context(event)
     except PermissionError as e:
-        return {'statusCode': 401, 'body': json.dumps({'error': str(e)})}
+        return {
+            'statusCode': 401,
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'error': str(e)})
+        }
 
     org_id = get_org_id(claims)
     role = get_role(claims)
@@ -27,7 +31,7 @@ def lambda_handler(event, context):
 
     return {
         'statusCode': 200,
-        'headers': {'Content-Type': 'application/json'},
+        'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
         'body': json.dumps({
             'user_id': claims.get('sub'),
             'role': role,

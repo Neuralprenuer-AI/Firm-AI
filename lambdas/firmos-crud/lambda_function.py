@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import jwt as pyjwt
 sys.path.insert(0, '/opt/python')
@@ -8,7 +9,9 @@ from shared_db import get_connection, assert_org_access, log_audit
 
 
 def _get_secret():
-    return None  # In production: returns None, falls through to JWKS
+    if os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
+        return None  # production: always use JWKS
+    return None  # tests: patched externally
 
 
 def _auth(event):
@@ -92,6 +95,8 @@ def lambda_handler(event, context):
         if role not in ('super_admin', 'firm_admin'):
             return _resp(403, {'error': 'forbidden'})
         org_id = caller_org_id if role == 'firm_admin' else (event.get('queryStringParameters') or {}).get('org_id')
+        if not org_id:
+            return _resp(400, {'error': 'org_id required for super_admin'})
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM firm_os.contacts WHERE org_id = %s ORDER BY created_at DESC", (org_id,))
             rows = cur.fetchall()
@@ -125,6 +130,8 @@ def lambda_handler(event, context):
     # GET /firmos/escalations
     if path == '/firmos/escalations' and method == 'GET':
         org_id = caller_org_id if role == 'firm_admin' else (event.get('queryStringParameters') or {}).get('org_id')
+        if not org_id:
+            return _resp(400, {'error': 'org_id required for super_admin'})
         status_filter = (event.get('queryStringParameters') or {}).get('status', 'open')
         with conn.cursor() as cur:
             cur.execute(
@@ -143,6 +150,19 @@ def lambda_handler(event, context):
         updates = {k: v for k, v in body.items() if k in allowed}
         if not updates:
             return _resp(400, {'error': 'no valid fields'})
+        if role == 'firm_admin':
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT org_id FROM firm_os.escalations WHERE escalation_id = %s",
+                    (esc_id,)
+                )
+                esc_row = cur.fetchone()
+            if not esc_row:
+                return _resp(404, {'error': 'not found'})
+            try:
+                assert_org_access(caller_org_id, str(esc_row['org_id']))
+            except PermissionError:
+                return _resp(403, {'error': 'forbidden'})
         set_clause = ', '.join(f"{k} = %s" for k in updates)
         extra_sql = ", resolved_at = NOW()" if updates.get('status') == 'resolved' else ""
         with conn.cursor() as cur:
@@ -196,6 +216,8 @@ def lambda_handler(event, context):
 
     # GET /firmos/team
     if path == '/firmos/team' and method == 'GET':
+        if role not in ('super_admin', 'firm_admin'):
+            return _resp(403, {'error': 'forbidden'})
         org_id = caller_org_id
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM firm_os.org_users WHERE org_id = %s ORDER BY created_at", (org_id,))
@@ -204,6 +226,8 @@ def lambda_handler(event, context):
 
     # POST /firmos/team
     if path == '/firmos/team' and method == 'POST':
+        if role not in ('super_admin', 'firm_admin'):
+            return _resp(403, {'error': 'forbidden'})
         org_id = caller_org_id
         with conn.cursor() as cur:
             cur.execute(
@@ -218,6 +242,8 @@ def lambda_handler(event, context):
 
     # DELETE /firmos/team/{user_id}
     if path.startswith('/firmos/team/') and method == 'DELETE' and params.get('user_id'):
+        if role not in ('super_admin', 'firm_admin'):
+            return _resp(403, {'error': 'forbidden'})
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM firm_os.org_users WHERE user_id = %s AND org_id = %s RETURNING user_id",
@@ -229,6 +255,8 @@ def lambda_handler(event, context):
 
     # PATCH /firmos/settings
     if path == '/firmos/settings' and method == 'PATCH':
+        if role not in ('super_admin', 'firm_admin'):
+            return _resp(403, {'error': 'forbidden'})
         org_id = caller_org_id
         allowed = {'monthly_sms_budget', 'after_hours_en', 'after_hours_es', 'timezone', 'default_language'}
         updates = {k: v for k, v in body.items() if k in allowed}
