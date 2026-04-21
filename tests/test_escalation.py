@@ -25,6 +25,7 @@ def test_escalation_creates_record_and_notifies():
             {'org_id': 'org-abc', 'name': 'Test Firm', 'secret_arn': 'arn:test',
              'twilio_phone_number': '+12815550002', 'twilio_subaccount_sid': 'ACsub'},
             {'phone': '+17135550001', 'name': 'John Doe'},
+            None,  # idempotency check — no existing open escalation
             {'escalation_id': 'esc-1'}
         ]
         cur.fetchall.return_value = [
