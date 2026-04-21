@@ -6,9 +6,10 @@ sys.path.insert(0, '/opt/python')
 
 from shared_db import get_connection, log_audit
 
-LANGUAGE_PROMPT = "Welcome! Reply 1 for English / Responde 2 para Español."
-ESCALATION_KEYWORDS_EN = ['emergency', 'urgent', 'arrested', 'injured', 'dying']
-ESCALATION_KEYWORDS_ES = ['arrestado', 'detenido', 'ICE', 'herido', 'me llevaron', 'emergencia']
+ESCALATION_KEYWORDS = [
+    'emergency', 'urgent', 'arrested', 'injured', 'dying',
+    'arrestado', 'detenido', 'ICE', 'herido', 'me llevaron', 'emergencia'
+]
 
 def _invoke(name: str, payload: dict):
     boto3.client('lambda', region_name='us-east-2').invoke(
@@ -51,7 +52,8 @@ def lambda_handler(event, context):
         )
         contact = cur.fetchone()
 
-    if not contact:
+    is_new_contact = contact is None
+    if is_new_contact:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO firm_os.contacts (org_id, phone, preferred_language, intake_status) "
@@ -70,21 +72,21 @@ def lambda_handler(event, context):
         )
         conv = cur.fetchone()
 
-    if not conv:
+    is_new_conv = conv is None
+    if is_new_conv:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO firm_os.conversations (org_id, contact_id, state) "
-                "VALUES (%s, %s, 'language_pending') RETURNING *",
+                "VALUES (%s, %s, 'intake_in_progress') RETURNING *",
                 (org_id, contact['contact_id'])
             )
             conv = cur.fetchone()
         conn.commit()
-        _send_sms(org, str(conv['conversation_id']), from_phone, LANGUAGE_PROMPT)
-        return
 
-    state = conv['state']
     conv_id = str(conv['conversation_id'])
+    state = conv['state']
 
+    # Log inbound message
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO firm_os.messages (org_id, conversation_id, direction, body) "
@@ -93,9 +95,9 @@ def lambda_handler(event, context):
         )
     conn.commit()
 
+    # Escalation keyword check — fires for any state
     body_lower = body.lower()
-    all_keywords = ESCALATION_KEYWORDS_EN + ESCALATION_KEYWORDS_ES
-    triggered = [kw for kw in all_keywords if kw.lower() in body_lower]
+    triggered = [kw for kw in ESCALATION_KEYWORDS if kw.lower() in body_lower]
     if triggered:
         _invoke('firmos-escalation', {
             'org_id': org_id,
@@ -105,44 +107,18 @@ def lambda_handler(event, context):
             'message_body': body
         })
 
-    if state == 'language_pending':
-        if body.strip() == '1':
-            lang, welcome = 'en', "Great! Let's get started. I'll be collecting some information for the firm."
-        elif body.strip() == '2':
-            lang, welcome = 'es', "¡Perfecto! Voy a recopilar información para el despacho."
-        else:
-            _send_sms(org, conv_id, from_phone, LANGUAGE_PROMPT)
-            return
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE firm_os.contacts SET preferred_language = %s WHERE contact_id = %s",
-                (lang, contact['contact_id'])
-            )
-            cur.execute(
-                "UPDATE firm_os.conversations SET state = 'intake_in_progress' WHERE conversation_id = %s",
-                (conv_id,)
-            )
-        conn.commit()
-        _send_sms(org, conv_id, from_phone, welcome)
-        _invoke('firmos-intake-agent', {
-            'org_id': org_id,
-            'contact_id': str(contact['contact_id']),
-            'conversation_id': conv_id,
-            'language': lang,
-            'message': ''
-        })
-        return
-
+    # Intake in progress — Gemini handles everything
     if state == 'intake_in_progress':
         _invoke('firmos-intake-agent', {
             'org_id': org_id,
             'contact_id': str(contact['contact_id']),
             'conversation_id': conv_id,
-            'language': contact.get('preferred_language', 'en'),
+            'is_new_contact': is_new_contact,
             'message': body
         })
         return
 
+    # Returning client (intake complete) — status bot
     if state == 'complete':
         _invoke('firmos-status-bot', {
             'org_id': org_id,

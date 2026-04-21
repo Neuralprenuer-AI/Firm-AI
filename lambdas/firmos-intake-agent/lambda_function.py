@@ -33,7 +33,7 @@ def lambda_handler(event, context):
     org_id = event['org_id']
     contact_id = event['contact_id']
     conv_id = event['conversation_id']
-    language = event.get('language', 'en')
+    is_new_contact = event.get('is_new_contact', False)
     user_message = event.get('message', '')
 
     try:
@@ -60,8 +60,18 @@ def lambda_handler(event, context):
             contact = cur.fetchone()
 
         system_prompt = load_prompt_from_s3(org['practice_area'])
-        if language == 'es':
-            system_prompt += "\n\nIMPORTANT: Respond only in Spanish."
+        firm_name = org.get('name', 'the firm')
+        system_prompt += f"\n\nFIRM NAME: {firm_name}"
+        if is_new_contact:
+            system_prompt += (
+                "\n\nNEW CLIENT: This is their very first message. "
+                "Greet them warmly using the firm name. "
+                "Detect their language from their message and respond in that language. "
+                "Acknowledge what they said, then ask 'En qué podemos ayudarle hoy?' (or English equivalent). "
+                "Do NOT ask for their name yet — let them lead."
+            )
+        else:
+            system_prompt += "\n\nRETURNING CLIENT: They have texted before. Skip the greeting."
 
         conversation_text = '\n'.join(
             f"{'Client' if m['direction'] == 'inbound' else 'Assistant'}: {m['body']}"
@@ -72,6 +82,15 @@ def lambda_handler(event, context):
 
         full_prompt = f"{conversation_text}\nAssistant:"
         reply = call_gemini(system_prompt=system_prompt, user_message=full_prompt)
+
+        # Detect and store language from Gemini's response language
+        if is_new_contact and reply:
+            detected = 'es' if any(w in reply for w in ['¡', 'ó', 'á', 'é', 'í', 'ú', 'ñ', 'usted', 'puede']) else 'en'
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE firm_os.contacts SET preferred_language = %s WHERE contact_id = %s",
+                    (detected, contact_id)
+                )
 
         if not reply or not reply.strip():
             reply = ("Our team will follow up with you shortly." if language == 'en'
