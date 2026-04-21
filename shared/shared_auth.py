@@ -16,9 +16,12 @@ def _get_jwks_client() -> PyJWKClient:
     return _jwks_client
 
 def verify_jwt(token: str) -> dict:
-    client = _get_jwks_client()
-    signing_key = client.get_signing_key_from_jwt(token)
-    return jwt.decode(token, signing_key.key, algorithms=['RS256'])
+    try:
+        client = _get_jwks_client()
+        signing_key = client.get_signing_key_from_jwt(token)
+        return jwt.decode(token, signing_key.key, algorithms=['RS256'])
+    except jwt.PyJWTError as e:
+        raise PermissionError(f"Invalid token: {type(e).__name__}") from e
 
 def get_org_id(claims: dict) -> str:
     return claims.get('app_metadata', {}).get('org_id')
