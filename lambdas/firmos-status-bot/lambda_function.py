@@ -88,5 +88,5 @@ def lambda_handler(event, context):
         except Exception:
             reply = msgs['no_clio']
 
-    _invoke_send(org, conv_id, contact['phone'], reply)
     log_audit(conn, org_id, 'status-bot', 'status.queried', {'contact_id': contact_id})
+    _invoke_send(org, conv_id, contact['phone'], reply)

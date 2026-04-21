@@ -1,4 +1,5 @@
 # tests/test_status_bot.py
+import json
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas', 'firmos-status-bot'))
@@ -60,7 +61,7 @@ def test_status_bot_clio_returns_matters():
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {'data': [{'id': '1', 'display_number': 'M-001', 'description': 'Immigration case', 'status': 'open', 'practice_area': {'name': 'Immigration'}}]}
+        mock_resp.json.return_value = {'data': [{'id': '1', 'display_number': 'M-001', 'description': 'Visa filing', 'status': 'open', 'practice_area': {'name': 'Immigration'}}]}
         mock_req.get.return_value = mock_resp
         mock_lambda = MagicMock()
         mock_secrets = MagicMock()
@@ -76,5 +77,3 @@ def test_status_bot_clio_returns_matters():
         call_args = mock_lambda.invoke.call_args
         payload = json.loads(call_args[1]['Payload'])
         assert 'Immigration' in payload['body']
-
-import json
