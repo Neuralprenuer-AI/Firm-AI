@@ -25,7 +25,7 @@ def test_clio_sync_creates_note():
              'practice_area': 'immigration'},
             {'contact_id': 'c-abc', 'phone': '+17135550001', 'name': 'John',
              'clio_contact_id': 'clio-contact-1'},
-            {'intake_id': 'i-abc', 'data': {}}
+            {'intake_id': 'i-abc', 'data': {}, 'clio_note_id': None}
         ]
         mock_conn.cursor.return_value.__enter__ = lambda s: cur
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
