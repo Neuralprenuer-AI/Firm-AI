@@ -1,9 +1,9 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas', 'firmos-intake-agent'))
 
 from unittest.mock import patch, MagicMock
 import pytest
+from conftest import load_lambda
 
 def _event():
     return {
@@ -25,11 +25,12 @@ def _mock_org():
     }
 
 def test_intake_agent_calls_gemini_and_sends_sms():
-    with patch('lambda_function.get_connection') as mock_conn_fn, \
-         patch('lambda_function.load_prompt_from_s3', return_value='System prompt here'), \
-         patch('lambda_function.call_gemini', return_value='What is your name?'), \
-         patch('lambda_function.boto3') as mock_boto, \
-         patch('lambda_function.log_audit'):
+    lf = load_lambda('firmos-intake-agent')
+    with patch.object(lf, 'get_connection') as mock_conn_fn, \
+         patch.object(lf, 'load_prompt_from_s3', return_value='System prompt here'), \
+         patch.object(lf, 'call_gemini', return_value='What is your name?'), \
+         patch.object(lf, 'boto3') as mock_boto, \
+         patch.object(lf, 'log_audit'):
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -42,16 +43,16 @@ def test_intake_agent_calls_gemini_and_sends_sms():
         mock_lambda.invoke.return_value = {'StatusCode': 200}
         mock_lambda.get_secret_value.return_value = {'SecretString': '{"twilio_auth_token":"tok"}'}
 
-        from lambda_function import lambda_handler
-        lambda_handler(_event(), {})
+        lf.lambda_handler(_event(), {})
         mock_lambda.invoke.assert_called()
 
 def test_intake_complete_triggers_clio_sync():
-    with patch('lambda_function.get_connection') as mock_conn_fn, \
-         patch('lambda_function.load_prompt_from_s3', return_value='System prompt'), \
-         patch('lambda_function.call_gemini', return_value='INTAKE_COMPLETE'), \
-         patch('lambda_function.boto3') as mock_boto, \
-         patch('lambda_function.log_audit'):
+    lf = load_lambda('firmos-intake-agent')
+    with patch.object(lf, 'get_connection') as mock_conn_fn, \
+         patch.object(lf, 'load_prompt_from_s3', return_value='System prompt'), \
+         patch.object(lf, 'call_gemini', return_value='INTAKE_COMPLETE'), \
+         patch.object(lf, 'boto3') as mock_boto, \
+         patch.object(lf, 'log_audit'):
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -67,7 +68,6 @@ def test_intake_complete_triggers_clio_sync():
         mock_lambda.invoke.return_value = {'StatusCode': 200}
         mock_lambda.get_secret_value.return_value = {'SecretString': '{"twilio_auth_token":"tok"}'}
 
-        from lambda_function import lambda_handler
-        lambda_handler(_event(), {})
+        lf.lambda_handler(_event(), {})
         calls = [c[1]['FunctionName'] for c in mock_lambda.invoke.call_args_list]
         assert 'firmos-clio-sync' in calls

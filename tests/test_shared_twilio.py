@@ -2,6 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared'))
 
 from unittest.mock import patch, MagicMock
+import importlib
 import pytest
 
 def test_send_sms_calls_twilio_client():
@@ -37,11 +38,17 @@ def test_send_sms_truncates_at_1600_chars():
         assert len(call_kwargs.kwargs['body']) == 1600
 
 def test_validate_twilio_signature_raises_on_invalid():
-    from shared_twilio import validate_signature
-    with pytest.raises(ValueError):
-        validate_signature(
-            auth_token='wrong-token',
-            signature='bad-sig',
-            url='https://example.com/webhook',
-            params={}
-        )
+    import shared_twilio as st
+    importlib.reload(st)
+    with patch.object(st, 'RequestValidator') as mock_rv_cls:
+        mock_validator = MagicMock()
+        mock_validator.validate.return_value = False
+        mock_rv_cls.return_value = mock_validator
+
+        with pytest.raises(ValueError):
+            st.validate_signature(
+                auth_token='wrong-token',
+                signature='bad-sig',
+                url='https://example.com/webhook',
+                params={}
+            )

@@ -1,10 +1,10 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas', 'firmos-sms-webhook'))
 
 from unittest.mock import patch, MagicMock
 import urllib.parse
 import pytest
+from conftest import load_lambda
 
 def _webhook_event(body='Hello', from_num='+17135550001', to_num='+12815550002'):
     params = {'Body': body, 'From': from_num, 'To': to_num}
@@ -18,9 +18,10 @@ def _mock_org():
     return {'org_id': 'org-abc', 'twilio_subaccount_sid': 'ACsub', 'secret_arn': 'arn:test'}
 
 def test_webhook_routes_to_router():
-    with patch('lambda_function.get_connection') as mock_conn_fn, \
-         patch('lambda_function.validate_signature'), \
-         patch('lambda_function.boto3') as mock_boto:
+    lf = load_lambda('firmos-sms-webhook')
+    with patch.object(lf, 'get_connection') as mock_conn_fn, \
+         patch.object(lf, 'validate_signature'), \
+         patch.object(lf, 'boto3') as mock_boto:
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -34,15 +35,15 @@ def test_webhook_routes_to_router():
         mock_secrets.get_secret_value.return_value = {'SecretString': '{"twilio_auth_token":"tok"}'}
         mock_lambda.invoke.return_value = {'StatusCode': 200}
 
-        from lambda_function import lambda_handler
-        result = lambda_handler(_webhook_event(), {})
+        result = lf.lambda_handler(_webhook_event(), {})
         assert result['statusCode'] == 200
         mock_lambda.invoke.assert_called_once()
 
 def test_webhook_returns_403_on_invalid_signature():
-    with patch('lambda_function.get_connection') as mock_conn_fn, \
-         patch('lambda_function.validate_signature', side_effect=ValueError("bad sig")), \
-         patch('lambda_function.boto3') as mock_boto:
+    lf = load_lambda('firmos-sms-webhook')
+    with patch.object(lf, 'get_connection') as mock_conn_fn, \
+         patch.object(lf, 'validate_signature', side_effect=ValueError("bad sig")), \
+         patch.object(lf, 'boto3') as mock_boto:
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -54,12 +55,12 @@ def test_webhook_returns_403_on_invalid_signature():
         mock_boto.client.return_value = mock_secrets
         mock_secrets.get_secret_value.return_value = {'SecretString': '{"twilio_auth_token":"tok"}'}
 
-        from lambda_function import lambda_handler
-        result = lambda_handler(_webhook_event(), {})
+        result = lf.lambda_handler(_webhook_event(), {})
         assert result['statusCode'] == 403
 
 def test_webhook_returns_404_for_unknown_number():
-    with patch('lambda_function.get_connection') as mock_conn_fn:
+    lf = load_lambda('firmos-sms-webhook')
+    with patch.object(lf, 'get_connection') as mock_conn_fn:
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -68,6 +69,5 @@ def test_webhook_returns_404_for_unknown_number():
         cur.fetchone.return_value = None
         mock_conn.cursor.return_value = cur
 
-        from lambda_function import lambda_handler
-        result = lambda_handler(_webhook_event(), {})
+        result = lf.lambda_handler(_webhook_event(), {})
         assert result['statusCode'] == 404

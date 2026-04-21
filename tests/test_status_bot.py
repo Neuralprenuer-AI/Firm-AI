@@ -1,11 +1,10 @@
-# tests/test_status_bot.py
 import json
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas', 'firmos-status-bot'))
 
 from unittest.mock import patch, MagicMock
 import pytest
+from conftest import load_lambda
 
 def _event():
     return {
@@ -21,9 +20,10 @@ def _mock_org():
     }
 
 def test_status_bot_no_clio_token_sends_fallback():
-    with patch('lambda_function.get_connection') as mock_conn_fn, \
-         patch('lambda_function.boto3') as mock_boto, \
-         patch('lambda_function.log_audit'):
+    lf = load_lambda('firmos-status-bot')
+    with patch.object(lf, 'get_connection') as mock_conn_fn, \
+         patch.object(lf, 'boto3') as mock_boto, \
+         patch.object(lf, 'log_audit'):
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -41,15 +41,15 @@ def test_status_bot_no_clio_token_sends_fallback():
         mock_boto.client.side_effect = side
         mock_lambda.invoke.return_value = {'StatusCode': 200}
 
-        from lambda_function import lambda_handler
-        lambda_handler(_event(), {})
+        lf.lambda_handler(_event(), {})
         mock_lambda.invoke.assert_called_once()
 
 def test_status_bot_clio_returns_matters():
-    with patch('lambda_function.get_connection') as mock_conn_fn, \
-         patch('lambda_function.requests') as mock_req, \
-         patch('lambda_function.boto3') as mock_boto, \
-         patch('lambda_function.log_audit'):
+    lf = load_lambda('firmos-status-bot')
+    with patch.object(lf, 'get_connection') as mock_conn_fn, \
+         patch.object(lf, 'requests') as mock_req, \
+         patch.object(lf, 'boto3') as mock_boto, \
+         patch.object(lf, 'log_audit'):
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -61,7 +61,9 @@ def test_status_bot_clio_returns_matters():
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {'data': [{'id': '1', 'display_number': 'M-001', 'description': 'Visa filing', 'status': 'open', 'practice_area': {'name': 'Immigration'}}]}
+        mock_resp.json.return_value = {'data': [{'id': '1', 'display_number': 'M-001',
+            'description': 'Visa filing', 'status': 'open',
+            'practice_area': {'name': 'Immigration'}}]}
         mock_req.get.return_value = mock_resp
         mock_lambda = MagicMock()
         mock_secrets = MagicMock()
@@ -72,8 +74,7 @@ def test_status_bot_clio_returns_matters():
         mock_boto.client.side_effect = side
         mock_lambda.invoke.return_value = {'StatusCode': 200}
 
-        from lambda_function import lambda_handler
-        lambda_handler(_event(), {})
+        lf.lambda_handler(_event(), {})
         call_args = mock_lambda.invoke.call_args
         payload = json.loads(call_args[1]['Payload'])
         assert 'Immigration' in payload['body']

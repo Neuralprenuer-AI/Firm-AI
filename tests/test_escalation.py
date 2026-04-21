@@ -1,9 +1,9 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas', 'firmos-escalation'))
 
 from unittest.mock import patch, MagicMock
 import pytest
+from conftest import load_lambda
 
 def _event():
     return {
@@ -15,9 +15,10 @@ def _event():
     }
 
 def test_escalation_creates_record_and_notifies():
-    with patch('lambda_function.get_connection') as mock_conn_fn, \
-         patch('lambda_function.boto3') as mock_boto, \
-         patch('lambda_function.log_audit'):
+    lf = load_lambda('firmos-escalation')
+    with patch.object(lf, 'get_connection') as mock_conn_fn, \
+         patch.object(lf, 'boto3') as mock_boto, \
+         patch.object(lf, 'log_audit'):
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
@@ -50,6 +51,5 @@ def test_escalation_creates_record_and_notifies():
         mock_boto.client.side_effect = client_side_effect
         mock_lambda.invoke.return_value = {'StatusCode': 200}
 
-        from lambda_function import lambda_handler
-        lambda_handler(_event(), {})
+        lf.lambda_handler(_event(), {})
         mock_ses.send_email.assert_called_once()
