@@ -74,11 +74,19 @@ def lambda_handler(event, context):
 
     is_new_conv = conv is None
     if is_new_conv:
+        # Returning client who finished intake gets a status conversation, not a new intake
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT intake_id FROM firm_os.intake_records WHERE contact_id = %s LIMIT 1",
+                (contact['contact_id'],)
+            )
+            has_intake = cur.fetchone()
+        new_state = 'status' if has_intake else 'intake_in_progress'
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO firm_os.conversations (org_id, contact_id, state) "
-                "VALUES (%s, %s, 'intake_in_progress') RETURNING *",
-                (org_id, contact['contact_id'])
+                "VALUES (%s, %s, %s) RETURNING *",
+                (org_id, contact['contact_id'], new_state)
             )
             conv = cur.fetchone()
         conn.commit()
@@ -118,8 +126,8 @@ def lambda_handler(event, context):
         })
         return
 
-    # Returning client (intake complete) — status bot
-    if state == 'complete':
+    # Returning client — status bot
+    if state in ('complete', 'status'):
         _invoke('firmos-status-bot', {
             'org_id': org_id,
             'contact_id': str(contact['contact_id']),
