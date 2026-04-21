@@ -35,7 +35,7 @@ def lambda_handler(event, context):
         contact_name = contact.get('name') or contact['phone']
         resp = requests.post(f'{CLIO_API}/contacts', headers=headers, json={
             'data': {'name': contact_name, 'phone_numbers': [{'name': 'Mobile', 'number': contact['phone']}]}
-        })
+        }, timeout=10)
         if resp.status_code in (200, 201):
             clio_contact_id = resp.json()['data']['id']
             with conn.cursor() as cur:
@@ -44,6 +44,9 @@ def lambda_handler(event, context):
                     (str(clio_contact_id), contact_id)
                 )
             conn.commit()
+        else:
+            log_audit(conn, org_id, 'clio-sync', 'clio.contact_create_failed',
+                      {'contact_id': contact_id, 'status': resp.status_code}, 'warning')
 
     note_subject = f"SMS Intake — {org['practice_area'].replace('_', ' ').title()}"
     note_body = f"Intake collected via SMS:\n\n{conversation_text}"
@@ -55,7 +58,7 @@ def lambda_handler(event, context):
             'contact': {'id': clio_contact_id} if clio_contact_id else None
         }
     }
-    note_resp = requests.post(f'{CLIO_API}/notes', headers=headers, json=note_payload)
+    note_resp = requests.post(f'{CLIO_API}/notes', headers=headers, json=note_payload, timeout=10)
 
     if note_resp.status_code in (200, 201):
         note_id = note_resp.json()['data']['id']
