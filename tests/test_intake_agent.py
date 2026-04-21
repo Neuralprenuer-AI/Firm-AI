@@ -33,7 +33,7 @@ def test_intake_agent_calls_gemini_and_sends_sms():
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
-        cur.fetchone.side_effect = [_mock_org(), {'phone': '+12815550001'}]
+        cur.fetchone.side_effect = [_mock_org(), {'phone': '+12815550001'}, {'turn_count': 1}]
         cur.fetchall.return_value = []
         mock_conn.cursor.return_value.__enter__ = lambda s: cur
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
@@ -55,7 +55,7 @@ def test_intake_complete_triggers_clio_sync():
         mock_conn = MagicMock()
         mock_conn_fn.return_value = mock_conn
         cur = MagicMock()
-        cur.fetchone.side_effect = [_mock_org(), {'phone': '+12815550001'}, {'intake_id': 'i-001'}]
+        cur.fetchone.side_effect = [_mock_org(), {'phone': '+12815550001'}, None, {'intake_id': 'i-001'}]
         cur.fetchall.return_value = [
             {'direction': 'inbound', 'body': 'John Doe'},
             {'direction': 'outbound', 'body': 'What happened?'}
