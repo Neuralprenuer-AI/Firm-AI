@@ -112,31 +112,40 @@ def lambda_handler(event, context):
         if not org_id:
             return _resp(400, {'error': 'org_id required for super_admin'})
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM firm_os.contacts WHERE org_id = %s ORDER BY created_at DESC", (org_id,))
+            cur.execute(
+                "SELECT c.contact_id, c.org_id, c.phone, c.name, c.preferred_language, "
+                "c.intake_status AS status, c.clio_contact_id, c.created_at, c.updated_at, "
+                "COUNT(cv.conversation_id) AS conversation_count, "
+                "MAX(m.created_at) AS last_contact "
+                "FROM firm_os.contacts c "
+                "LEFT JOIN firm_os.conversations cv ON c.contact_id = cv.contact_id "
+                "LEFT JOIN firm_os.messages m ON cv.conversation_id = m.conversation_id "
+                "WHERE c.org_id = %s "
+                "GROUP BY c.contact_id "
+                "ORDER BY MAX(m.created_at) DESC NULLS LAST",
+                (org_id,)
+            )
             rows = cur.fetchall()
         return _resp(200, [dict(r) for r in rows])
 
     # GET /firmos/conversations
     if path == '/firmos/conversations' and method == 'GET':
-        contact_id = (event.get('queryStringParameters') or {}).get('contact_id')
-        if not contact_id:
-            return _resp(400, {'error': 'contact_id required'})
-        with conn.cursor() as cur:
-            cur.execute("SELECT org_id FROM firm_os.contacts WHERE contact_id = %s", (contact_id,))
-            c = cur.fetchone()
-        if not c:
-            return _resp(404, {'error': 'contact not found'})
-        if role == 'firm_admin':
-            try:
-                assert_org_access(caller_org_id, str(c['org_id']))
-            except PermissionError:
-                return _resp(403, {'error': 'forbidden'})
+        org_id = caller_org_id if role == 'firm_admin' else (event.get('queryStringParameters') or {}).get('org_id')
+        if not org_id:
+            return _resp(400, {'error': 'org_id required for super_admin'})
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT m.* FROM firm_os.messages m "
-                "JOIN firm_os.conversations cv ON m.conversation_id = cv.conversation_id "
-                "WHERE cv.contact_id = %s ORDER BY m.created_at ASC",
-                (contact_id,)
+                "SELECT cv.conversation_id, cv.org_id, cv.contact_id, cv.state, cv.turn_count, "
+                "cv.created_at, cv.updated_at, "
+                "c.name AS contact_name, c.phone AS contact_phone, "
+                "(SELECT m.body FROM firm_os.messages m "
+                " WHERE m.conversation_id = cv.conversation_id "
+                " ORDER BY m.created_at DESC LIMIT 1) AS last_message_preview "
+                "FROM firm_os.conversations cv "
+                "JOIN firm_os.contacts c ON cv.contact_id = c.contact_id "
+                "WHERE cv.org_id = %s "
+                "ORDER BY cv.updated_at DESC",
+                (org_id,)
             )
             rows = cur.fetchall()
         return _resp(200, [dict(r) for r in rows])
@@ -226,12 +235,23 @@ def lambda_handler(event, context):
                 (org_id,)
             )
             chart = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT e.escalation_id, c.name AS contact_name, e.triggered_keyword AS keyword, "
+                "e.created_at AS time, e.status "
+                "FROM firm_os.escalations e "
+                "JOIN firm_os.contacts c ON e.contact_id = c.contact_id "
+                "WHERE e.org_id = %s AND e.status = 'open' "
+                "ORDER BY e.created_at DESC LIMIT 5",
+                (org_id,)
+            )
+            recent_escs = [dict(r) for r in cur.fetchall()]
         return _resp(200, {
-            'sms_today': sms_today,
+            'sms_sent_today': sms_today,
             'active_conversations': active_convs,
             'open_escalations': open_escs,
-            'new_contacts_week': new_contacts,
-            'volume_chart': chart
+            'contacts_this_week': new_contacts,
+            'recent_escalations': recent_escs,
+            'conversation_volume': [{'date': str(r['day']), 'count': r['count']} for r in chart]
         })
 
     # GET /firmos/team
@@ -267,6 +287,27 @@ def lambda_handler(event, context):
         conn.commit()
         log_audit(conn, org_id, claims.get('sub', 'system'), 'team.member_added', {'email': body['email'], 'org_role': body.get('org_role', 'associate')})
         return _resp(201, dict(row))
+
+    # PATCH /firmos/team/{user_id}
+    if path.startswith('/firmos/team/') and method == 'PATCH' and params.get('user_id'):
+        if role not in ('super_admin', 'firm_admin'):
+            return _resp(403, {'error': 'forbidden'})
+        allowed = {'escalation_routing', 'org_role'}
+        updates = {k: v for k, v in body.items() if k in allowed}
+        if not updates:
+            return _resp(400, {'error': 'no valid fields'})
+        set_clause = ', '.join(f"{k} = %s" for k in updates)
+        vals = list(updates.values()) + [params['user_id'], caller_org_id]
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE firm_os.org_users SET {set_clause} WHERE user_id = %s AND org_id = %s RETURNING *",
+                vals
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return _resp(404, {'error': 'not found'})
+        return _resp(200, dict(row))
 
     # DELETE /firmos/team/{user_id}
     if path.startswith('/firmos/team/') and method == 'DELETE' and params.get('user_id'):
@@ -318,14 +359,18 @@ def lambda_handler(event, context):
         sev_filter = qp.get('severity')
         conditions, vals = [], []
         if org_filter:
-            conditions.append("org_id = %s")
+            conditions.append("a.org_id = %s")
             vals.append(org_filter)
         if sev_filter:
-            conditions.append("severity = %s")
+            conditions.append("a.severity = %s")
             vals.append(sev_filter)
         where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
         with conn.cursor() as cur:
-            cur.execute(f"SELECT * FROM firm_os.audit_log {where} ORDER BY created_at DESC LIMIT 500", vals)
+            cur.execute(
+                f"SELECT a.*, o.name AS firm_name "
+                f"FROM firm_os.audit_log a "
+                f"LEFT JOIN firm_os.organizations o ON a.org_id = o.org_id "
+                f"{where} ORDER BY a.created_at DESC LIMIT 500", vals)
             rows = cur.fetchall()
         return _resp(200, [dict(r) for r in rows])
 
@@ -527,7 +572,13 @@ def lambda_handler(event, context):
     if path.startswith('/firmos/conversations/') and method == 'GET' and params.get('id') and not path.endswith('/messages'):
         conv_id = params['id']
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM firm_os.conversations WHERE conversation_id = %s", (conv_id,))
+            cur.execute(
+                "SELECT cv.*, c.name AS contact_name, c.phone AS contact_phone "
+                "FROM firm_os.conversations cv "
+                "JOIN firm_os.contacts c ON cv.contact_id = c.contact_id "
+                "WHERE cv.conversation_id = %s",
+                (conv_id,)
+            )
             row = cur.fetchone()
         if not row:
             return _resp(404, {'error': 'not found'})
@@ -544,7 +595,12 @@ def lambda_handler(event, context):
             return _resp(403, {'error': 'firm_admin required'})
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM firm_os.intake_records WHERE org_id = %s ORDER BY created_at DESC",
+                "SELECT ir.intake_id, ir.org_id, ir.conversation_id, ir.contact_id, "
+                "ir.data, ir.summary_en, ir.clio_matter_id, ir.created_at, "
+                "c.name AS contact_name, c.phone AS contact_phone "
+                "FROM firm_os.intake_records ir "
+                "LEFT JOIN firm_os.contacts c ON ir.contact_id = c.contact_id "
+                "WHERE ir.org_id = %s ORDER BY ir.created_at DESC",
                 (caller_org_id,)
             )
             rows = cur.fetchall()
@@ -552,6 +608,12 @@ def lambda_handler(event, context):
 
     # GET /firmos/calls
     if path == '/firmos/calls' and method == 'GET':
+        return _resp(200, [])
+
+    # GET /firmos/audits — daily digest stubs (not yet implemented)
+    if path == '/firmos/audits' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
         return _resp(200, [])
 
     return _resp(404, {'error': 'route not found'})
