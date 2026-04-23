@@ -610,10 +610,56 @@ def lambda_handler(event, context):
     if path == '/firmos/calls' and method == 'GET':
         return _resp(200, [])
 
-    # GET /firmos/audits — daily digest stubs (not yet implemented)
+    # GET /firmos/audits — daily digest stub
     if path == '/firmos/audits' and method == 'GET':
         if role != 'firm_admin':
             return _resp(403, {'error': 'firm_admin required'})
         return _resp(200, [])
+
+    # GET /firmos/billing
+    if path == '/firmos/billing' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT billing_status, monthly_sms_budget FROM firm_os.organizations WHERE org_id = %s",
+                (caller_org_id,)
+            )
+            row = cur.fetchone()
+        if not row:
+            return _resp(404, {'error': 'not found'})
+        status = row['billing_status']
+        plan_map = {'paid': 'Professional', 'trial': 'Trial', 'unpaid': 'Unpaid'}
+        return _resp(200, {
+            'status': status,
+            'plan_name': plan_map.get(status, 'Trial'),
+            'sms_limit': row['monthly_sms_budget'] or 500,
+            'features': ['SMS intake', 'Escalation routing', 'Audit log', 'Team management'],
+            'renews_at': None
+        })
+
+    # GET /firmos/onboarding
+    if path == '/firmos/onboarding' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, practice_area, city, state, website, billing_status, "
+                "twilio_subaccount_sid, crm_platform, default_language "
+                "FROM firm_os.organizations WHERE org_id = %s",
+                (caller_org_id,)
+            )
+            row = cur.fetchone()
+        if not row:
+            return _resp(404, {'error': 'not found'})
+        r = dict(row)
+        return _resp(200, {
+            'firm': {'name': r.get('name'), 'practice_area': r.get('practice_area'),
+                     'city': r.get('city'), 'state': r.get('state'), 'website': r.get('website')},
+            'twilio': {'phone_number': None, 'a2p_status': 'not_submitted' if not r.get('twilio_subaccount_sid') else 'pending'},
+            'clio': {'connected': bool(r.get('crm_platform')), 'connect_url': None},
+            'language': {'default_language': r.get('default_language') or 'en', 'spanish_enabled': False},
+            'current_step': 0
+        })
 
     return _resp(404, {'error': 'route not found'})
