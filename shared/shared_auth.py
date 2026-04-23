@@ -19,7 +19,7 @@ def verify_jwt(token: str) -> dict:
     try:
         client = _get_jwks_client()
         signing_key = client.get_signing_key_from_jwt(token)
-        return jwt.decode(token, signing_key.key, algorithms=['RS256'])
+        return jwt.decode(token, signing_key.key, algorithms=['RS256', 'ES256'])
     except jwt.PyJWTError as e:
         raise PermissionError(f"Invalid token: {type(e).__name__}") from e
 

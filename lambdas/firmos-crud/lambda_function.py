@@ -319,4 +319,229 @@ def lambda_handler(event, context):
             rows = cur.fetchall()
         return _resp(200, [dict(r) for r in rows])
 
+    # GET /firmos/settings/firm
+    if path == '/firmos/settings/firm' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, practice_area, agent_display_name, timezone, partner_email, "
+                "emergency_contact_number, intake_phone_number, status_phone_number "
+                "FROM firm_os.organizations WHERE org_id = %s",
+                (caller_org_id,)
+            )
+            row = cur.fetchone()
+        return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
+
+    # PATCH /firmos/settings/firm
+    if path == '/firmos/settings/firm' and method == 'PATCH':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        allowed = {'name', 'practice_area', 'agent_display_name', 'timezone', 'partner_email', 'emergency_contact_number'}
+        updates = {k: v for k, v in body.items() if k in allowed}
+        if not updates:
+            return _resp(400, {'error': 'no valid fields'})
+        set_clause = ', '.join(f"{k} = %s" for k in updates)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE firm_os.organizations SET {set_clause}, updated_at = NOW() "
+                f"WHERE org_id = %s RETURNING *",
+                list(updates.values()) + [caller_org_id]
+            )
+            row = cur.fetchone()
+        conn.commit()
+        log_audit(conn, caller_org_id, claims.get('sub', 'system'), 'org.firm_settings_updated', updates)
+        return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
+
+    # GET /firmos/settings/voice
+    if path == '/firmos/settings/voice' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT agent_display_name, after_hours_only, greeting_message_en, greeting_message_es, "
+                "after_hours_start, after_hours_end, timezone "
+                "FROM firm_os.organizations WHERE org_id = %s",
+                (caller_org_id,)
+            )
+            row = cur.fetchone()
+        return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
+
+    # PATCH /firmos/settings/voice
+    if path == '/firmos/settings/voice' and method == 'PATCH':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        allowed = {'agent_display_name', 'after_hours_only', 'greeting_message_en', 'greeting_message_es', 'after_hours_start', 'after_hours_end'}
+        updates = {k: v for k, v in body.items() if k in allowed}
+        if not updates:
+            return _resp(400, {'error': 'no valid fields'})
+        set_clause = ', '.join(f"{k} = %s" for k in updates)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE firm_os.organizations SET {set_clause}, updated_at = NOW() "
+                f"WHERE org_id = %s RETURNING *",
+                list(updates.values()) + [caller_org_id]
+            )
+            row = cur.fetchone()
+        conn.commit()
+        log_audit(conn, caller_org_id, claims.get('sub', 'system'), 'org.voice_settings_updated', updates)
+        return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
+
+    # GET /firmos/settings/compliance
+    if path == '/firmos/settings/compliance' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT mandatory_disclaimer, escalation_keywords, audit_digest_recipients "
+                "FROM firm_os.organizations WHERE org_id = %s",
+                (caller_org_id,)
+            )
+            row = cur.fetchone()
+        return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
+
+    # PATCH /firmos/settings/compliance
+    if path == '/firmos/settings/compliance' and method == 'PATCH':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        allowed = {'mandatory_disclaimer', 'escalation_keywords'}
+        updates = {k: v for k, v in body.items() if k in allowed}
+        if 'escalation_keywords' in updates:
+            updates['escalation_keywords'] = body.get('escalation_keywords', [])
+        if not updates:
+            return _resp(400, {'error': 'no valid fields'})
+        set_clause = ', '.join(f"{k} = %s" for k in updates)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE firm_os.organizations SET {set_clause}, updated_at = NOW() "
+                f"WHERE org_id = %s RETURNING *",
+                list(updates.values()) + [caller_org_id]
+            )
+            row = cur.fetchone()
+        conn.commit()
+        log_audit(conn, caller_org_id, claims.get('sub', 'system'), 'org.compliance_settings_updated', {k: v for k, v in updates.items() if k != 'escalation_keywords'})
+        return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
+
+    # GET /firmos/settings/crm
+    if path == '/firmos/settings/crm' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT crm_platform, clio_access_token, clio_token_expires_at, updated_at "
+                "FROM firm_os.organizations WHERE org_id = %s",
+                (caller_org_id,)
+            )
+            row = cur.fetchone()
+        if not row:
+            return _resp(404, {'error': 'not found'})
+        r = dict(row)
+        connected = bool(r.get('crm_platform') and r.get('clio_access_token'))
+        return _resp(200, {
+            'connected': connected,
+            'platform': r.get('crm_platform'),
+            'connected_at': r.get('clio_token_expires_at') or r.get('updated_at')
+        })
+
+    # DELETE /firmos/settings/crm
+    if path == '/firmos/settings/crm' and method == 'DELETE':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE firm_os.organizations SET crm_platform = NULL, clio_access_token = NULL, "
+                "clio_refresh_token = NULL, clio_token_expires_at = NULL, updated_at = NOW() "
+                "WHERE org_id = %s",
+                (caller_org_id,)
+            )
+        conn.commit()
+        log_audit(conn, caller_org_id, claims.get('sub', 'system'), 'org.crm_disconnected', {})
+        return _resp(200, {'disconnected': True})
+
+    # GET /firmos/settings/crm/oauth-url
+    if path == '/firmos/settings/crm/oauth-url' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        return _resp(200, {
+            'url': 'https://app.clio.com/oauth/authorize?response_type=code&client_id=placeholder&redirect_uri=https://app.neuralpreneur.com/settings/crm/callback&scope=contacts%3Aread%20matters%3Aread'
+        })
+
+    # GET /firmos/contacts/{contact_id}/conversations
+    if path.startswith('/firmos/contacts/') and method == 'GET':
+        parts = path.split('/')
+        contact_id = parts[3] if len(parts) >= 5 and parts[4] == 'conversations' else None
+        if contact_id:
+            with conn.cursor() as cur:
+                cur.execute("SELECT org_id FROM firm_os.contacts WHERE contact_id = %s", (contact_id,))
+                c = cur.fetchone()
+            if not c:
+                return _resp(404, {'error': 'contact not found'})
+            if role == 'firm_admin':
+                try:
+                    assert_org_access(caller_org_id, str(c['org_id']))
+                except PermissionError:
+                    return _resp(403, {'error': 'forbidden'})
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM firm_os.conversations WHERE contact_id = %s ORDER BY created_at DESC",
+                    (contact_id,)
+                )
+                rows = cur.fetchall()
+            return _resp(200, [dict(r) for r in rows])
+        # GET /firmos/contacts/{contact_id} — single contact
+        single_contact_id = params.get('contact_id') or (parts[3] if len(parts) >= 4 else None)
+        if single_contact_id:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM firm_os.contacts WHERE contact_id = %s", (single_contact_id,))
+                row = cur.fetchone()
+            if not row:
+                return _resp(404, {'error': 'not found'})
+            if role == 'firm_admin':
+                try:
+                    assert_org_access(caller_org_id, str(row['org_id']))
+                except PermissionError:
+                    return _resp(403, {'error': 'forbidden'})
+            return _resp(200, dict(row))
+
+    # GET /firmos/conversations/{id}/messages
+    if path.endswith('/messages') and method == 'GET':
+        parts = path.split('/')
+        conv_id = parts[3] if len(parts) >= 5 else None
+        if conv_id:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM firm_os.messages WHERE conversation_id = %s ORDER BY created_at ASC", (conv_id,))
+                rows = cur.fetchall()
+            return _resp(200, [dict(r) for r in rows])
+
+    # GET /firmos/conversations/{id} — single conversation
+    if path.startswith('/firmos/conversations/') and method == 'GET' and params.get('id') and not path.endswith('/messages'):
+        conv_id = params['id']
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM firm_os.conversations WHERE conversation_id = %s", (conv_id,))
+            row = cur.fetchone()
+        if not row:
+            return _resp(404, {'error': 'not found'})
+        if role == 'firm_admin':
+            try:
+                assert_org_access(caller_org_id, str(row['org_id']))
+            except PermissionError:
+                return _resp(403, {'error': 'forbidden'})
+        return _resp(200, dict(row))
+
+    # GET /firmos/intakes
+    if path == '/firmos/intakes' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM firm_os.intake_records WHERE org_id = %s ORDER BY created_at DESC",
+                (caller_org_id,)
+            )
+            rows = cur.fetchall()
+        return _resp(200, [dict(r) for r in rows])
+
+    # GET /firmos/calls
+    if path == '/firmos/calls' and method == 'GET':
+        return _resp(200, [])
+
     return _resp(404, {'error': 'route not found'})
