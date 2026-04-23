@@ -1,8 +1,14 @@
 import json
 import os
 import sys
+import re
 import jwt as pyjwt
 sys.path.insert(0, '/opt/python')
+
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+def _valid_uuid(v):
+    return bool(v and _UUID_RE.match(str(v)))
 
 from shared_auth import auth_context as _jwks_auth_context, get_org_id, get_role
 from shared_db import get_connection, assert_org_access, log_audit
@@ -63,6 +69,8 @@ def lambda_handler(event, context):
     # GET /firmos/firms/{org_id}
     if path.startswith('/firmos/firms/') and method == 'GET' and params.get('org_id'):
         target = params['org_id']
+        if not _valid_uuid(target):
+            return _resp(400, {'error': 'invalid org_id'})
         if role == 'firm_admin':
             try:
                 assert_org_access(caller_org_id, target)
@@ -78,6 +86,8 @@ def lambda_handler(event, context):
         if role != 'super_admin':
             return _resp(403, {'error': 'super_admin required'})
         target = params['org_id']
+        if not _valid_uuid(target):
+            return _resp(400, {'error': 'invalid org_id'})
         allowed = {'name', 'billing_status', 'status', 'practice_area', 'monthly_sms_budget'}
         updates = {k: v for k, v in body.items() if k in allowed}
         if not updates:

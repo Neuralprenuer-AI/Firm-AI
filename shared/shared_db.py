@@ -13,6 +13,14 @@ def get_connection():
             client.get_secret_value(SecretId='firmos/rds/credentials')['SecretString']
         )
         _conn = psycopg2.connect(secret['url'], cursor_factory=RealDictCursor)
+    else:
+        # Roll back any aborted transaction from a previous invocation so the
+        # reused connection starts clean. rollback() is a no-op on an idle connection.
+        try:
+            _conn.rollback()
+        except Exception:
+            _conn = None
+            return get_connection()
     return _conn
 
 def assert_org_access(caller_org_id: str, record_org_id: str):
