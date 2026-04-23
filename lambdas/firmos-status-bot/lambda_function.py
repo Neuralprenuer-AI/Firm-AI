@@ -1,8 +1,10 @@
 import json
+import re
 import os
 import boto3
 import requests
 import sys
+from datetime import datetime, timezone
 sys.path.insert(0, '/opt/python')
 
 from shared_db import get_connection, log_audit
@@ -10,6 +12,7 @@ from shared_ai import call_gemini, load_prompt_from_s3
 
 CLIO_API = 'https://app.clio.com/api/v4'
 REGION = os.environ.get('AWS_REGION', 'us-east-2')
+SMS_CHAR_LIMIT = 320
 
 def _invoke_send(org, conv_id, to_phone, body):
     secret = json.loads(
@@ -27,6 +30,35 @@ def _invoke_send(org, conv_id, to_phone, body):
             'subaccount_token': secret['twilio_auth_token']
         }).encode()
     )
+
+def _split_and_send(org, conv_id, to_phone, text):
+    if len(text) <= SMS_CHAR_LIMIT:
+        _invoke_send(org, conv_id, to_phone, text)
+        return
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunk = ''
+    for s in sentences:
+        if len(chunk) + len(s) + 1 <= SMS_CHAR_LIMIT:
+            chunk = (chunk + ' ' + s).strip() if chunk else s
+        else:
+            if chunk:
+                _invoke_send(org, conv_id, to_phone, chunk)
+            chunk = s
+    if chunk:
+        _invoke_send(org, conv_id, to_phone, chunk)
+
+
+def _clio_token_valid(org):
+    expires = org.get('clio_token_expires_at')
+    if not expires:
+        return False
+    if isinstance(expires, str):
+        try:
+            expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+        except ValueError:
+            return False
+    return expires > datetime.now(timezone.utc)
+
 
 def _get_clio_context(clio_token, clio_contact_id):
     if not clio_token or not clio_contact_id:
@@ -61,7 +93,7 @@ def lambda_handler(event, context):
     user_message = event.get('message', '')
 
     if not all([org_id, contact_id, conv_id]):
-        raise ValueError("Missing required fields")
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required fields'})}
 
     conn = get_connection()
 
@@ -69,7 +101,7 @@ def lambda_handler(event, context):
         cur.execute("SELECT * FROM firm_os.organizations WHERE org_id = %s AND status = 'active'", (org_id,))
         org = cur.fetchone()
     if not org:
-        raise ValueError(f"org not found: {org_id}")
+        return {'statusCode': 404, 'body': json.dumps({'error': f'org not found: {org_id}'})}
 
     with conn.cursor() as cur:
         cur.execute(
@@ -79,7 +111,7 @@ def lambda_handler(event, context):
         )
         contact = cur.fetchone()
     if not contact:
-        raise ValueError(f"contact not found: {contact_id}")
+        return {'statusCode': 404, 'body': json.dumps({'error': f'contact not found: {contact_id}'})}
 
     language = contact.get('preferred_language', 'en')
     firm_name = org.get('name', 'the firm')
@@ -112,8 +144,9 @@ def lambda_handler(event, context):
         if not client_name and history_text:
             intake_summary = history_text[-800:]  # last 800 chars of intake
 
-    # Pull Clio case context
-    clio_context = _get_clio_context(org.get('clio_access_token'), contact.get('clio_contact_id'))
+    # Pull Clio case context — only if token is still valid
+    clio_token = org.get('clio_access_token') if _clio_token_valid(org) else None
+    clio_context = _get_clio_context(clio_token, contact.get('clio_contact_id'))
 
     # Load status prompt (falls back to intake prompt if status_v1 not found)
     try:
@@ -168,7 +201,7 @@ def lambda_handler(event, context):
                 'message_body': user_message
             }).encode()
         )
-        return
+        return {'statusCode': 200, 'body': json.dumps({'status': 'escalated'})}
 
     # Store outbound message
     with conn.cursor() as cur:
@@ -179,4 +212,4 @@ def lambda_handler(event, context):
     conn.commit()
 
     log_audit(conn, org_id, 'status-bot', 'status.replied', {'contact_id': contact_id})
-    _invoke_send(org, conv_id, contact['phone'], reply)
+    _split_and_send(org, conv_id, contact['phone'], reply)

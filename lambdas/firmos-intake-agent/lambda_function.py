@@ -1,4 +1,5 @@
 import json
+import re
 import boto3
 import sys
 sys.path.insert(0, '/opt/python')
@@ -6,12 +7,21 @@ sys.path.insert(0, '/opt/python')
 from shared_db import get_connection, log_audit
 from shared_ai import call_gemini, load_prompt_from_s3
 
+SMS_CHAR_LIMIT = 320  # split above this to avoid 1600-char blobs
+
+RE_INTAKE_TRIGGERS = [
+    'new case', 'new matter', 'another case', 'different case',
+    'nuevo caso', 'otro caso', 'nueva consulta'
+]
+
+
 def _invoke(name, payload):
     boto3.client('lambda', region_name='us-east-2').invoke(
         FunctionName=name,
         InvocationType='Event',
         Payload=json.dumps(payload).encode()
     )
+
 
 def _send_sms(org, conv_id, to_phone, body):
     secrets = boto3.client('secretsmanager', region_name='us-east-2')
@@ -24,11 +34,42 @@ def _send_sms(org, conv_id, to_phone, body):
         'subaccount_token': secret['twilio_auth_token']
     })
 
+
+def _split_and_send(org, conv_id, to_phone, text):
+    """Split long replies at sentence boundaries before sending."""
+    if len(text) <= SMS_CHAR_LIMIT:
+        _send_sms(org, conv_id, to_phone, text)
+        return
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunk = ''
+    for s in sentences:
+        if len(chunk) + len(s) + 1 <= SMS_CHAR_LIMIT:
+            chunk = (chunk + ' ' + s).strip() if chunk else s
+        else:
+            if chunk:
+                _send_sms(org, conv_id, to_phone, chunk)
+            chunk = s
+    if chunk:
+        _send_sms(org, conv_id, to_phone, chunk)
+
+
+def _extract_name(conversation_text):
+    """Pull a name from intake conversation if client introduced themselves."""
+    patterns = [
+        r"(?:my name is|i'm|i am|me llamo|soy)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, conversation_text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def lambda_handler(event, context):
     required = ['org_id', 'contact_id', 'conversation_id']
     for field in required:
         if not event.get(field):
-            raise ValueError(f"Missing required field: {field}")
+            return {"statusCode": 400, "body": json.dumps({"error": f"Missing required field: {field}"})}
 
     org_id = event['org_id']
     contact_id = event['contact_id']
@@ -56,8 +97,31 @@ def lambda_handler(event, context):
             history = cur.fetchall()
 
         with conn.cursor() as cur:
-            cur.execute("SELECT phone FROM firm_os.contacts WHERE contact_id = %s AND org_id = %s", (contact_id, org_id))
+            cur.execute(
+                "SELECT phone, name, preferred_language FROM firm_os.contacts WHERE contact_id = %s AND org_id = %s",
+                (contact_id, org_id)
+            )
             contact = cur.fetchone()
+
+        language = contact.get('preferred_language') or 'en'
+
+        # Re-intake detection: returning client wants to open a new matter
+        msg_lower = user_message.lower()
+        if not is_new_contact and any(t in msg_lower for t in RE_INTAKE_TRIGGERS):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE firm_os.conversations SET state = 'complete' WHERE conversation_id = %s",
+                    (conv_id,)
+                )
+                cur.execute(
+                    "INSERT INTO firm_os.conversations (org_id, contact_id, state) VALUES (%s, %s, 'intake_in_progress') RETURNING *",
+                    (org_id, contact_id)
+                )
+                new_conv = cur.fetchone()
+            conn.commit()
+            conv_id = str(new_conv['conversation_id'])
+            is_new_contact = False
+            history = []
 
         system_prompt = load_prompt_from_s3(org['practice_area'])
         firm_name = org.get('name', 'the firm')
@@ -73,6 +137,9 @@ def lambda_handler(event, context):
         else:
             system_prompt += "\n\nRETURNING CLIENT: They have texted before. Skip the greeting."
 
+        if contact.get('name'):
+            system_prompt += f"\n\nCLIENT NAME: {contact['name']}"
+
         conversation_text = '\n'.join(
             f"{'Client' if m['direction'] == 'inbound' else 'Assistant'}: {m['body']}"
             for m in history
@@ -83,18 +150,36 @@ def lambda_handler(event, context):
         full_prompt = f"{conversation_text}\nAssistant:"
         reply = call_gemini(system_prompt=system_prompt, user_message=full_prompt)
 
-        # Detect and store language from Gemini's response language
+        # Detect and store language from Gemini's response
         if is_new_contact and reply:
             detected = 'es' if any(w in reply for w in ['¡', 'ó', 'á', 'é', 'í', 'ú', 'ñ', 'usted', 'puede']) else 'en'
+            language = detected
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE firm_os.contacts SET preferred_language = %s WHERE contact_id = %s",
                     (detected, contact_id)
                 )
+            conn.commit()
 
         if not reply or not reply.strip():
             reply = ("Our team will follow up with you shortly." if language == 'en'
                      else "Nuestro equipo se comunicará con usted en breve.")
+
+        # ABA Rule 5.3 — mandatory disclaimer on first message only
+        if is_new_contact and len(history) <= 1:
+            disclaimer_en = (
+                org.get('mandatory_disclaimer') or
+                "IMPORTANT: I'm an AI assistant, not an attorney. "
+                "No attorney-client relationship is formed until confirmed in writing by a licensed attorney. "
+                "Nothing I send constitutes legal advice."
+            )
+            disclaimer_es = (
+                "IMPORTANTE: Soy un asistente de IA, no un abogado. "
+                "Ninguna relación abogado-cliente se forma hasta que un abogado con licencia lo confirme por escrito. "
+                "Nada de lo que envío constituye asesoría legal."
+            )
+            disclaimer = disclaimer_es if language == 'es' else disclaimer_en
+            reply = disclaimer + "\n\n" + reply
 
         if 'INTAKE_COMPLETE' in reply:
             with conn.cursor() as cur:
@@ -104,7 +189,10 @@ def lambda_handler(event, context):
                 )
                 existing = cur.fetchone()
             if existing:
-                return  # Already processed, idempotent
+                return  # Idempotent
+
+            # Try to extract client name from conversation
+            extracted_name = _extract_name(conversation_text)
 
             with conn.cursor() as cur:
                 cur.execute(
@@ -117,6 +205,11 @@ def lambda_handler(event, context):
                     (org_id, conv_id, contact_id, json.dumps({'history': conversation_text}))
                 )
                 intake = cur.fetchone()
+                if extracted_name and not contact.get('name'):
+                    cur.execute(
+                        "UPDATE firm_os.contacts SET name = %s WHERE contact_id = %s",
+                        (extracted_name, contact_id)
+                    )
             conn.commit()
 
             closing = ("Thank you! The firm will review your information and contact you shortly."
@@ -147,14 +240,25 @@ def lambda_handler(event, context):
         with conn.cursor() as cur:
             cur.execute("SELECT turn_count FROM firm_os.conversations WHERE conversation_id = %s", (conv_id,))
             tc = cur.fetchone()
-        if tc and tc['turn_count'] >= 20:
+
+        turn_count = tc['turn_count'] if tc else 0
+
+        if turn_count >= 20:
             _invoke('firmos-escalation', {
                 'org_id': org_id, 'contact_id': contact_id, 'conversation_id': conv_id,
                 'triggered_keyword': 'turn_limit_exceeded', 'message_body': user_message
             })
             return
 
-        _send_sms(org, conv_id, contact['phone'], reply)
+        # Warn client at turn 18 that they'll be connected to a person soon
+        if turn_count == 18:
+            warn = ("We're gathering the last few details. An attorney will reach out to you directly soon."
+                    if language == 'en' else
+                    "Estamos recopilando los últimos detalles. Un abogado se comunicará con usted pronto.")
+            _split_and_send(org, conv_id, contact['phone'], warn)
+        else:
+            _split_and_send(org, conv_id, contact['phone'], reply)
+
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE firm_os.conversations SET turn_count = turn_count + 1 WHERE conversation_id = %s",
@@ -167,4 +271,5 @@ def lambda_handler(event, context):
             "intake-agent error: %s | org_id=%s conv_id=%s",
             type(e).__name__, org_id, event.get('conversation_id', 'unknown')
         )
-        raise
+        status = 400 if isinstance(e, ValueError) else 500
+        return {"statusCode": status, "body": json.dumps({"error": str(e)})}

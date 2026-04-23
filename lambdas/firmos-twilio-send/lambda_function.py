@@ -6,10 +6,18 @@ from shared_db import get_connection, log_audit, assert_org_access
 from shared_twilio import send_sms
 
 def lambda_handler(event, context):
-    org_id = event['org_id']
-    to_phone = event['to_phone']
-    body = event['body']
-    subaccount_token = event['subaccount_token']
+    org_id = event.get('org_id')
+    if not org_id:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: org_id'})}
+    to_phone = event.get('to_phone')
+    if not to_phone:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: to_phone'})}
+    body = event.get('body')
+    if body is None:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: body'})}
+    subaccount_token = event.get('subaccount_token')
+    if not subaccount_token:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: subaccount_token'})}
 
     conn = get_connection()
 

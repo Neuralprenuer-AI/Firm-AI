@@ -1,0 +1,51 @@
+name: Test & Lint
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - feature/**
+      - fix/**
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install pytest ruff boto3 requests twilio psycopg2-binary
+
+      - name: Ruff lint check
+        run: ruff check lambdas/ shared/ --output-format=github
+
+      - name: Syntax check Lambda functions
+        run: python -m py_compile lambdas/*/lambda_function.py
+
+      - name: Run pytest
+        run: |
+          if [ -d tests ] && [ -n "$(find tests -name 'test_*.py' -o -name '*_test.py')" ]; then
+            pytest tests/ -v --tb=short
+          else
+            echo "No tests found"
+          fi
+
+      - name: Test Summary
+        run: |
+          LAMBDA_COUNT=$(find lambdas -maxdepth 1 -type d -name 'firmos-*' | wc -l)
+          echo "Tested $LAMBDA_COUNT Lambda functions"

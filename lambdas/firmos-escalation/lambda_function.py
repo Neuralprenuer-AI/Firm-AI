@@ -9,10 +9,18 @@ from shared_db import get_connection, log_audit
 logger = logging.getLogger(__name__)
 
 def lambda_handler(event, context):
-    org_id = event['org_id']
-    contact_id = event['contact_id']
-    conv_id = event['conversation_id']
-    keyword = event['triggered_keyword']
+    org_id = event.get('org_id')
+    if not org_id:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: org_id'})}
+    contact_id = event.get('contact_id')
+    if not contact_id:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: contact_id'})}
+    conv_id = event.get('conversation_id')
+    if not conv_id:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: conversation_id'})}
+    keyword = event.get('triggered_keyword')
+    if not keyword:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: triggered_keyword'})}
     message_body = event.get('message_body', '')
 
     conn = get_connection()

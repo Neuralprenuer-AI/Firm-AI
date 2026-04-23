@@ -4,14 +4,23 @@ import boto3
 import sys
 sys.path.insert(0, '/opt/python')
 
-from shared_db import get_connection
+from shared_db import get_connection, log_audit
 from shared_twilio import validate_signature
 
 def lambda_handler(event, context):
-    params = dict(urllib.parse.parse_qsl(event.get('body', '')))
+    import logging
+    _log = logging.getLogger(__name__)
+    raw_body = event.get('body', '') or ''
+    is_b64 = event.get('isBase64Encoded', False)
+    _log.warning("WEBHOOK raw_body_len=%d is_b64=%s headers=%s", len(raw_body), is_b64, list((event.get('headers') or {}).keys()))
+    if is_b64:
+        import base64
+        raw_body = base64.b64decode(raw_body).decode('utf-8')
+    params = dict(urllib.parse.parse_qsl(raw_body))
     from_number = params.get('From', '')
     to_number = params.get('To', '')
     body = params.get('Body', '')
+    _log.warning("WEBHOOK from=%s to=%s params=%s", from_number, to_number, dict(params))
     signature = event.get('headers', {}).get('X-Twilio-Signature', '')
     domain = event.get('requestContext', {}).get('domainName', '')
     path = event.get('requestContext', {}).get('path', '')
@@ -35,13 +44,13 @@ def lambda_handler(event, context):
     )
 
     try:
-        validate_signature(
-            auth_token=secret['twilio_auth_token'],
-            signature=signature,
-            url=url,
-            params=params
-        )
+        validate_signature(auth_token=secret['twilio_auth_token'], signature=signature, url=url, params=params)
     except ValueError:
+        import logging
+        logging.getLogger(__name__).warning("Invalid Twilio signature from=%s url=%s", from_number, url)
+        log_audit(conn, org['org_id'], 'system', 'twilio.signature_invalid',
+                  {'from': from_number, 'url': url}, 'warning')
+        conn.commit()
         return {'statusCode': 403, 'body': ''}
 
     lambda_client = boto3.client('lambda', region_name='us-east-2')
@@ -52,7 +61,9 @@ def lambda_handler(event, context):
             'org_id': str(org['org_id']),
             'from_phone': from_number,
             'to_phone': to_number,
-            'body': body
+            'body': body,
+            'message_sid': params.get('MessageSid', ''),
+            'num_media': params.get('NumMedia', '0')
         }).encode()
     )
 

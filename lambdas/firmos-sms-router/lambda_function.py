@@ -2,9 +2,13 @@
 import json
 import boto3
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 sys.path.insert(0, '/opt/python')
 
 from shared_db import get_connection, log_audit
+
+STOP_KEYWORDS = ['stop', 'stopall', 'unsubscribe', 'cancel', 'end', 'quit']
 
 ESCALATION_KEYWORDS = [
     'emergency', 'urgent', 'arrested', 'injured', 'dying',
@@ -29,10 +33,31 @@ def _send_sms(org, conversation_id, to_phone, body):
         'subaccount_token': secret['twilio_auth_token']
     })
 
+def _is_after_hours(org):
+    tz_name = org.get('timezone') or 'America/Chicago'
+    try:
+        tz = ZoneInfo(tz_name)
+        now = datetime.now(tz)
+        # Business hours: Mon-Fri 8am-6pm
+        if now.weekday() >= 5:
+            return True
+        return not (8 <= now.hour < 18)
+    except Exception:
+        return False
+
 def lambda_handler(event, context):
-    org_id = event['org_id']
-    from_phone = event['from_phone']
-    body = event['body'].strip()
+    org_id = event.get('org_id')
+    if not org_id:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: org_id'})}
+    from_phone = event.get('from_phone')
+    if not from_phone:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: from_phone'})}
+    body_raw = event.get('body')
+    if body_raw is None:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'Missing required field: body'})}
+    body = body_raw.strip()
+    message_sid = event.get('message_sid', '')
+    num_media = int(event.get('num_media', 0))
     conn = get_connection()
 
     with conn.cursor() as cur:
@@ -45,12 +70,38 @@ def lambda_handler(event, context):
     if not org:
         return
 
+    # TCPA opt-out — must be first thing checked, before any contact lookup
+    if body.lower().strip() in STOP_KEYWORDS:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE firm_os.contacts SET opted_out = TRUE WHERE org_id = %s AND phone = %s",
+                (org_id, from_phone)
+            )
+        conn.commit()
+        _send_sms(org, None, from_phone,
+                  "You have been unsubscribed. No further messages will be sent. Reply START to resubscribe.")
+        return
+
+    if body.lower().strip() == 'start':
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE firm_os.contacts SET opted_out = FALSE WHERE org_id = %s AND phone = %s",
+                (org_id, from_phone)
+            )
+        conn.commit()
+        _send_sms(org, None, from_phone,
+                  "You have been resubscribed. Welcome back!")
+        return
+
     with conn.cursor() as cur:
         cur.execute(
             "SELECT * FROM firm_os.contacts WHERE org_id = %s AND phone = %s",
             (org_id, from_phone)
         )
         contact = cur.fetchone()
+
+    if contact and contact.get('opted_out'):
+        return  # Silently drop — contact opted out
 
     is_new_contact = contact is None
     if is_new_contact:
@@ -94,14 +145,48 @@ def lambda_handler(event, context):
     conv_id = str(conv['conversation_id'])
     state = conv['state']
 
+    # MessageSid deduplication — Twilio may retry webhooks
+    if message_sid:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT message_id FROM firm_os.messages WHERE twilio_message_sid = %s",
+                (message_sid,)
+            )
+            if cur.fetchone():
+                return  # Already processed
+
     # Log inbound message
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO firm_os.messages (org_id, conversation_id, direction, body) "
-            "VALUES (%s, %s, 'inbound', %s)",
-            (org_id, conv_id, body)
+            "INSERT INTO firm_os.messages (org_id, conversation_id, direction, body, twilio_message_sid) "
+            "VALUES (%s, %s, 'inbound', %s, %s)",
+            (org_id, conv_id, body, message_sid or None)
         )
     conn.commit()
+
+    # MMS — client sent a photo/document
+    if num_media > 0:
+        lang = contact.get('preferred_language', 'en')
+        ack = ("Got it! We received your document. An attorney will review it shortly."
+               if lang == 'en' else
+               "¡Recibido! Hemos recibido su documento. Un abogado lo revisará pronto.")
+        _send_sms(org, conv_id, from_phone, ack)
+        log_audit(conn, org_id, 'system', 'sms.mms_received',
+                  {'contact_id': str(contact['contact_id']), 'num_media': num_media})
+        return
+
+    # After-hours check — only for new intake messages (not escalations)
+    if is_new_conv and _is_after_hours(org):
+        lang = contact.get('preferred_language', 'en') if not is_new_contact else 'en'
+        after_hours_msg = (
+            org.get('after_hours_en') or
+            "Thanks for reaching out! Our office is currently closed. We'll respond the next business day."
+        ) if lang == 'en' else (
+            org.get('after_hours_es') or
+            "¡Gracias por contactarnos! Nuestra oficina está cerrada ahora. Le responderemos el siguiente día hábil."
+        )
+        _send_sms(org, conv_id, from_phone, after_hours_msg)
+        return
 
     # Escalation keyword check — fires for any state
     body_lower = body.lower()
