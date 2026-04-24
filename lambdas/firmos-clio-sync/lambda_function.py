@@ -196,8 +196,8 @@ def _sync_contact_matters(conn, org_id: str, contact_id: str, clio_contact_id: s
     Returns the count of matters processed.
     """
     url = (
-        f"{CLIO_API}/matters"
-        f"?contact_id={clio_contact_id}"
+        f"{CLIO_API}/matters.json"
+        f"?client_id={clio_contact_id}"
         f"&status=open"
         f"&fields=id,display_number,description,status,practice_area,close_date,custom_field_values"
     )

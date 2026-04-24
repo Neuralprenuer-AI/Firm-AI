@@ -57,7 +57,7 @@ def _create_clio_contact(token: str, name: str, phone: str) -> tuple[int | None,
     }
     try:
         resp = requests.post(
-            f'{CLIO_API}/contacts',
+            f'{CLIO_API}/contacts.json',
             headers=_clio_headers(token),
             json=payload,
             timeout=CLIO_REQUEST_TIMEOUT,
@@ -70,6 +70,23 @@ def _create_clio_contact(token: str, name: str, phone: str) -> tuple[int | None,
     return None, resp.text[:500]
 
 
+def _lookup_practice_area_id(token: str, name: str) -> int | None:
+    try:
+        resp = requests.get(
+            f'{CLIO_API}/practice_areas.json',
+            headers=_clio_headers(token),
+            params={'name': name},
+            timeout=CLIO_REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            items = resp.json().get('data', [])
+            if items:
+                return items[0]['id']
+    except requests.RequestException:
+        pass
+    return None
+
+
 def _create_clio_matter(
     token: str,
     clio_contact_id: int,
@@ -77,21 +94,25 @@ def _create_clio_matter(
     practice_area_name: str,
 ) -> tuple[int | None, str | None]:
     """
-    POST /api/v4/matters.
+    POST /api/v4/matters.json
 
     Returns (matter_id, None) on success or (None, error_body) on 4xx/5xx.
     """
-    payload = {
-        'data': {
-            'client': {'id': clio_contact_id},
-            'description': description,
-            'practice_area': {'name': practice_area_name},
-            'status': 'Pending',
-        }
+    practice_area_id = _lookup_practice_area_id(token, practice_area_name)
+    practice_area_field = {'id': practice_area_id} if practice_area_id else None
+
+    matter_data: dict = {
+        'client': {'id': clio_contact_id},
+        'description': description,
+        'status': 'pending',
     }
+    if practice_area_field:
+        matter_data['practice_area'] = practice_area_field
+
+    payload = {'data': matter_data}
     try:
         resp = requests.post(
-            f'{CLIO_API}/matters',
+            f'{CLIO_API}/matters.json',
             headers=_clio_headers(token),
             json=payload,
             timeout=CLIO_REQUEST_TIMEOUT,
