@@ -22,26 +22,32 @@ CLIO_REQUEST_TIMEOUT = 10
 # Token helpers
 # ---------------------------------------------------------------------------
 
-def _load_clio_credentials(org_id: str) -> dict:
-    """Fetch Clio OAuth credentials from Secrets Manager."""
+def _load_clio_app_credentials() -> dict:
+    """Fetch global Clio OAuth app credentials (client_id + client_secret) from Secrets Manager."""
     client = boto3.client('secretsmanager', region_name='us-east-2')
-    secret_id = f'firmos/{org_id}/clio-credentials'
-    raw = client.get_secret_value(SecretId=secret_id)['SecretString']
+    raw = client.get_secret_value(SecretId='firmos/clio/oauth')['SecretString']
     return json.loads(raw)
 
 
 def _refresh_clio_token(conn, org: dict) -> dict | None:
     """
-    Attempt a Clio OAuth token refresh.
+    Attempt a Clio OAuth token refresh using the org's stored refresh_token.
 
     Returns updated org dict on success, None on failure.
-    Logs system.clio_token_refresh_failed (severity='critical') on failure.
+    Clio refresh response does NOT return a new refresh_token — keep existing.
     """
     org_id = str(org['org_id'])
+    refresh_token = org.get('clio_refresh_token') or ''
+    if not refresh_token:
+        logger.error("No refresh token stored for org %s — cannot refresh", org_id)
+        log_audit(conn, org_id, 'clio-sync', 'system.clio_token_refresh_failed',
+                  {'reason': 'no_refresh_token'}, severity='critical')
+        return None
+
     try:
-        creds = _load_clio_credentials(org_id)
+        creds = _load_clio_app_credentials()
     except Exception as exc:
-        logger.error("Could not load Clio credentials for org %s: %s", org_id, exc)
+        logger.error("Could not load Clio app credentials: %s", exc)
         log_audit(conn, org_id, 'clio-sync', 'system.clio_token_refresh_failed',
                   {'reason': 'secrets_load_error', 'error': str(exc)}, severity='critical')
         return None
@@ -51,7 +57,7 @@ def _refresh_clio_token(conn, org: dict) -> dict | None:
             CLIO_TOKEN_URL,
             data={
                 'grant_type': 'refresh_token',
-                'refresh_token': creds['refresh_token'],
+                'refresh_token': refresh_token,
                 'client_id': creds['client_id'],
                 'client_secret': creds['client_secret'],
             },
@@ -72,25 +78,22 @@ def _refresh_clio_token(conn, org: dict) -> dict | None:
 
     token_data = resp.json()
     new_access = token_data['access_token']
-    new_refresh = token_data.get('refresh_token', creds['refresh_token'])
-    expires_in = token_data.get('expires_in', 3600)
+    expires_in = token_data.get('expires_in', 604800)
     new_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
     with conn.cursor() as cur:
         cur.execute(
             """UPDATE firm_os.organizations
                SET clio_access_token     = %s,
-                   clio_refresh_token    = %s,
                    clio_token_expires_at = %s
                WHERE org_id = %s""",
-            (new_access, new_refresh, new_expires_at, org_id),
+            (new_access, new_expires_at, org_id),
         )
     conn.commit()
 
     logger.info("Refreshed Clio token for org %s", org_id)
     return {**dict(org),
             'clio_access_token': new_access,
-            'clio_refresh_token': new_refresh,
             'clio_token_expires_at': new_expires_at}
 
 

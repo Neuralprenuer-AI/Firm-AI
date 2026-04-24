@@ -1,8 +1,11 @@
+import boto3
 import json
 import os
 import sys
 import re
+import uuid
 import jwt as pyjwt
+from urllib.parse import urlencode
 sys.path.insert(0, '/opt/python')
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
@@ -517,9 +520,29 @@ def lambda_handler(event, context):
     if path == '/firmos/settings/crm/oauth-url' and method == 'GET':
         if role != 'firm_admin':
             return _resp(403, {'error': 'firm_admin required'})
-        return _resp(200, {
-            'url': 'https://app.clio.com/oauth/authorize?response_type=code&client_id=placeholder&redirect_uri=https://app.neuralpreneur.com/settings/crm/callback&scope=contacts%3Aread%20matters%3Aread'
+        try:
+            sm = boto3.client('secretsmanager', region_name='us-east-2')
+            raw = sm.get_secret_value(SecretId='firmos/clio/oauth')['SecretString']
+            clio_client_id = json.loads(raw)['client_id']
+        except Exception as exc:
+            logger.error("Failed to load Clio OAuth credentials: %s", exc)
+            return _resp(500, {'error': 'server_error'})
+        nonce = str(uuid.uuid4())
+        state = json.dumps({'org_id': caller_org_id, 'nonce': nonce})
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE firm_os.organizations SET clio_oauth_state = %s WHERE org_id = %s",
+                (nonce, caller_org_id),
+            )
+        conn.commit()
+        params = urlencode({
+            'response_type': 'code',
+            'client_id': clio_client_id,
+            'redirect_uri': 'https://kezjhodcig.execute-api.us-east-2.amazonaws.com/prod/firmos/clio/callback',
+            'state': state,
+            'redirect_on_decline': 'true',
         })
+        return _resp(200, {'url': f'https://app.clio.com/oauth/authorize?{params}'})
 
     # GET /firmos/contacts/{contact_id}/conversations
     if path.startswith('/firmos/contacts/') and method == 'GET':
