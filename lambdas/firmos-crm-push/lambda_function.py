@@ -109,7 +109,7 @@ def _create_clio_matter(
 # ---------------------------------------------------------------------------
 
 def lambda_handler(event, context):
-    required_fields = ('org_id', 'contact_id', 'intake_id', 'conversation_text')
+    required_fields = ('org_id', 'contact_id', 'intake_id')
     for field in required_fields:
         if not event.get(field):
             logger.error("crm-push: missing required field=%s", field)
@@ -122,7 +122,6 @@ def lambda_handler(event, context):
     org_id = str(event['org_id'])
     contact_id = str(event['contact_id'])
     intake_id = str(event['intake_id'])
-    conversation_text = event['conversation_text']
 
     conn = get_connection()
 
@@ -175,7 +174,8 @@ def lambda_handler(event, context):
     # -----------------------------------------------------------------------
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT intake_id, org_id, data, crm_pushed, crm_matter_id
+            """SELECT intake_id, org_id, data, fields, full_name, brief_description,
+                      crm_pushed, crm_matter_id
                FROM firm_os.intake_records
                WHERE intake_id = %s AND org_id = %s""",
             (intake_id, org_id),
@@ -196,9 +196,23 @@ def lambda_handler(event, context):
     # -----------------------------------------------------------------------
     # 5. Extract intake fields from JSONB data
     # -----------------------------------------------------------------------
+    # New schema (migration 017): full_name + brief_description as dedicated columns
+    # Fall back to old data JSONB for backwards compatibility
     intake_data: dict = intake.get('data') or {}
-    intake_name = intake_data.get('intake_name') or contact.get('name') or contact['phone']
-    intake_issue = intake_data.get('intake_issue') or 'New matter from SMS intake'
+    fields_data: dict = intake.get('fields') or {}
+    intake_name = (
+        intake.get('full_name')
+        or fields_data.get('full_name')
+        or intake_data.get('intake_name')
+        or contact.get('name')
+        or contact['phone']
+    )
+    intake_issue = (
+        intake.get('brief_description')
+        or fields_data.get('brief_description')
+        or intake_data.get('intake_issue')
+        or 'New matter from SMS intake'
+    )
     practice_area_name = (org.get('practice_area') or 'General').replace('_', ' ').title()
 
     # -----------------------------------------------------------------------
