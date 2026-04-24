@@ -143,13 +143,20 @@ def _build_notes_text(matter: dict) -> str:
     if matter.get('practice_area') and isinstance(matter['practice_area'], dict):
         practice_area_name = matter['practice_area'].get('name', '')
 
+    responsible_name = ''
+    if matter.get('responsible_attorney') and isinstance(matter['responsible_attorney'], dict):
+        responsible_name = matter['responsible_attorney'].get('name', '')
+
     lines = [
         f"Matter ID: {matter.get('id', '')}",
         f"Display Number: {matter.get('display_number', '')}",
         f"Description: {matter.get('description', '')}",
         f"Status: {matter.get('status', '')}",
         f"Practice Area: {practice_area_name}",
+        f"Open Date: {matter.get('open_date', '')}",
+        f"Pending Date: {matter.get('pending_date', '')}",
         f"Close Date: {matter.get('close_date', '')}",
+        f"Responsible Attorney: {responsible_name}",
     ]
     for cf in (matter.get('custom_field_values') or []):
         field_name = cf.get('field_name') or (cf.get('custom_field') or {}).get('name', '')
@@ -169,40 +176,212 @@ def _upsert_matter(conn, org_id: str, contact_id: str, matter: dict) -> None:
     notes_hash = hashlib.sha256(notes_text.encode()).hexdigest()
     matter_display_number = matter.get('display_number', '')
     matter_status = matter.get('status', '')
+    open_date = matter.get('open_date') or None
+    pending_date = matter.get('pending_date') or None
+
+    responsible_name = None
+    if matter.get('responsible_attorney') and isinstance(matter['responsible_attorney'], dict):
+        responsible_name = matter['responsible_attorney'].get('name') or None
 
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO firm_os.case_status_cache
                    (org_id, contact_id, clio_matter_id, matter_display_number,
-                    matter_status, notes_text, notes_hash, last_synced_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    matter_status, notes_text, notes_hash, last_synced_at,
+                    responsible_attorney_name, open_date, pending_date)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s)
                ON CONFLICT (org_id, clio_matter_id)
                DO UPDATE SET
-                   contact_id            = EXCLUDED.contact_id,
-                   matter_display_number = EXCLUDED.matter_display_number,
-                   matter_status         = EXCLUDED.matter_status,
-                   notes_text            = EXCLUDED.notes_text,
-                   notes_hash            = EXCLUDED.notes_hash,
-                   last_synced_at        = NOW()
+                   contact_id                = EXCLUDED.contact_id,
+                   matter_display_number     = EXCLUDED.matter_display_number,
+                   matter_status             = EXCLUDED.matter_status,
+                   notes_text                = EXCLUDED.notes_text,
+                   notes_hash                = EXCLUDED.notes_hash,
+                   last_synced_at            = NOW(),
+                   responsible_attorney_name = EXCLUDED.responsible_attorney_name,
+                   open_date                 = EXCLUDED.open_date,
+                   pending_date              = EXCLUDED.pending_date
                WHERE firm_os.case_status_cache.notes_hash != EXCLUDED.notes_hash""",
             (org_id, contact_id, clio_matter_id, matter_display_number,
-             matter_status, notes_text, notes_hash),
+             matter_status, notes_text, notes_hash,
+             responsible_name, open_date, pending_date),
         )
     conn.commit()
 
 
-def _sync_contact_matters(conn, org_id: str, contact_id: str, clio_contact_id: str, token: str) -> int:
-    """
-    Fetch all open Clio matters for one contact and upsert them.
+def _sync_notes(conn, org_id: str, contact_id: str, clio_matter_id: str, token: str) -> None:
+    """Pull notes for a matter and upsert into clio_notes."""
+    url = f"{CLIO_API}/notes.json?matter_id={clio_matter_id}&fields=id,subject,detail,date"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        resp = requests.get(url, headers=headers, timeout=CLIO_REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning("notes fetch failed matter %s: %s", clio_matter_id, resp.status_code)
+            return
+        for note in resp.json().get('data', []):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO firm_os.clio_notes
+                           (org_id, contact_id, clio_matter_id, clio_note_id, subject, detail, note_date, synced_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                       ON CONFLICT (org_id, clio_note_id) DO UPDATE SET
+                           subject=EXCLUDED.subject, detail=EXCLUDED.detail,
+                           note_date=EXCLUDED.note_date, synced_at=NOW()""",
+                    (org_id, contact_id, clio_matter_id, str(note['id']),
+                     note.get('subject'), note.get('detail'), note.get('date'))
+                )
+        conn.commit()
+    except requests.RequestException as exc:
+        logger.warning("notes HTTP error matter %s: %s", clio_matter_id, exc)
 
-    Raises RuntimeError on Clio API failure so the caller can log and continue.
-    Returns the count of matters processed.
-    """
+
+def _sync_communications(conn, org_id: str, contact_id: str, clio_matter_id: str, token: str) -> None:
+    """Pull communications for a matter and upsert into clio_communications."""
+    url = f"{CLIO_API}/communications.json?matter_id={clio_matter_id}&fields=id,type,subject,body,received_at"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        resp = requests.get(url, headers=headers, timeout=CLIO_REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning("comms fetch failed matter %s: %s", clio_matter_id, resp.status_code)
+            return
+        for comm in resp.json().get('data', []):
+            received_at = comm.get('received_at') or None
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO firm_os.clio_communications
+                           (org_id, contact_id, clio_matter_id, clio_comm_id, comm_type, subject, body, received_at, synced_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                       ON CONFLICT (org_id, clio_comm_id) DO UPDATE SET
+                           comm_type=EXCLUDED.comm_type, subject=EXCLUDED.subject,
+                           body=EXCLUDED.body, received_at=EXCLUDED.received_at, synced_at=NOW()""",
+                    (org_id, contact_id, clio_matter_id, str(comm['id']),
+                     comm.get('type'), comm.get('subject'), comm.get('body'), received_at)
+                )
+        conn.commit()
+    except requests.RequestException as exc:
+        logger.warning("comms HTTP error matter %s: %s", clio_matter_id, exc)
+
+
+def _sync_calendar_entries(conn, org_id: str, contact_id: str, clio_matter_id: str, token: str) -> None:
+    """Pull calendar entries for a matter and upsert into clio_calendar_entries."""
+    url = f"{CLIO_API}/calendar_entries.json?matter_id={clio_matter_id}&fields=id,summary,start_at,end_at,all_day"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        resp = requests.get(url, headers=headers, timeout=CLIO_REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning("calendar fetch failed matter %s: %s", clio_matter_id, resp.status_code)
+            return
+        for entry in resp.json().get('data', []):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO firm_os.clio_calendar_entries
+                           (org_id, contact_id, clio_matter_id, clio_entry_id, summary, start_at, end_at, all_day, synced_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                       ON CONFLICT (org_id, clio_entry_id) DO UPDATE SET
+                           summary=EXCLUDED.summary, start_at=EXCLUDED.start_at,
+                           end_at=EXCLUDED.end_at, all_day=EXCLUDED.all_day, synced_at=NOW()""",
+                    (org_id, contact_id, clio_matter_id, str(entry['id']),
+                     entry.get('summary'), entry.get('start_at'), entry.get('end_at'),
+                     entry.get('all_day', False))
+                )
+        conn.commit()
+    except requests.RequestException as exc:
+        logger.warning("calendar HTTP error matter %s: %s", clio_matter_id, exc)
+
+
+def _sync_conversations(conn, org_id: str, clio_matter_id: str, token: str) -> None:
+    """Pull conversations + messages for a matter."""
+    url = f"{CLIO_API}/conversations.json?matter_id={clio_matter_id}&fields=id,subject"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        resp = requests.get(url, headers=headers, timeout=CLIO_REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning("conversations fetch failed matter %s: %s", clio_matter_id, resp.status_code)
+            return
+        for conv in resp.json().get('data', []):
+            clio_conv_id = str(conv['id'])
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO firm_os.clio_conversations
+                           (org_id, clio_matter_id, clio_conv_id, subject, synced_at)
+                       VALUES (%s, %s, %s, %s, NOW())
+                       ON CONFLICT (org_id, clio_conv_id) DO UPDATE SET
+                           subject=EXCLUDED.subject, synced_at=NOW()""",
+                    (org_id, clio_matter_id, clio_conv_id, conv.get('subject'))
+                )
+            conn.commit()
+            msg_url = f"{CLIO_API}/conversation_messages.json?conversation_id={clio_conv_id}&fields=id,body,created_at,author{{name}}"
+            try:
+                msg_resp = requests.get(msg_url, headers=headers, timeout=CLIO_REQUEST_TIMEOUT)
+                if msg_resp.status_code == 200:
+                    for msg in msg_resp.json().get('data', []):
+                        author_name = None
+                        if isinstance(msg.get('author'), dict):
+                            author_name = msg['author'].get('name')
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO firm_os.clio_conversation_messages
+                                       (org_id, clio_conv_id, clio_msg_id, body, author_name, created_at, synced_at)
+                                   VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                                   ON CONFLICT (org_id, clio_msg_id) DO UPDATE SET
+                                       body=EXCLUDED.body, synced_at=NOW()""",
+                                (org_id, clio_conv_id, str(msg['id']),
+                                 msg.get('body'), author_name, msg.get('created_at'))
+                            )
+                    conn.commit()
+            except requests.RequestException as exc:
+                logger.warning("messages HTTP error conv %s: %s", clio_conv_id, exc)
+    except requests.RequestException as exc:
+        logger.warning("conversations HTTP error matter %s: %s", clio_matter_id, exc)
+
+
+def _sync_contact_back(conn, org_id: str, contact_id: str, clio_contact_id: str, token: str) -> None:
+    """Pull contact name/email/phone from Clio and update firm_os.contacts."""
+    url = f"{CLIO_API}/contacts/{clio_contact_id}.json?fields=id,first_name,last_name,email_addresses,phone_numbers"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        resp = requests.get(url, headers=headers, timeout=CLIO_REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning("contact sync-back failed %s: %s", clio_contact_id, resp.status_code)
+            return
+        data = resp.json().get('data', {})
+        first = data.get('first_name', '') or ''
+        last = data.get('last_name', '') or ''
+        full_name = f"{first} {last}".strip() or None
+        email = None
+        for e in (data.get('email_addresses') or []):
+            if e.get('default_email') or email is None:
+                email = e.get('address')
+        phone = None
+        for p in (data.get('phone_numbers') or []):
+            if p.get('default_number') or phone is None:
+                phone = p.get('number')
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE firm_os.contacts
+                   SET name  = COALESCE(%s, name),
+                       email = COALESCE(%s, email),
+                       phone = COALESCE(%s, phone)
+                   WHERE contact_id = %s AND org_id = %s""",
+                (full_name, email, phone, contact_id, org_id)
+            )
+        conn.commit()
+    except requests.RequestException as exc:
+        logger.warning("contact sync-back HTTP error %s: %s", clio_contact_id, exc)
+
+
+def _sync_contact_all(conn, org_id: str, contact_id: str, clio_contact_id: str, token: str) -> int:
+    """Sync all Clio data for one contact: contact sync-back, matters, notes, comms, calendar, conversations."""
+    _sync_contact_back(conn, org_id, contact_id, clio_contact_id, token)
+
     url = (
         f"{CLIO_API}/matters.json"
         f"?client_id={clio_contact_id}"
         f"&status=open"
-        f"&fields=id,display_number,description,status,practice_area{{name}},close_date,custom_field_values{{field_name,value}}"
+        f"&fields=id,display_number,description,status,practice_area{{name}},"
+        f"open_date,pending_date,close_date,"
+        f"responsible_attorney{{name}},"
+        f"custom_field_values{{field_name,value}}"
     )
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
@@ -217,8 +396,13 @@ def _sync_contact_matters(conn, org_id: str, contact_id: str, clio_contact_id: s
     matters = resp.json().get('data', [])
     for matter in matters:
         _upsert_matter(conn, org_id, contact_id, matter)
+        clio_matter_id = str(matter['id'])
+        _sync_notes(conn, org_id, contact_id, clio_matter_id, token)
+        _sync_communications(conn, org_id, contact_id, clio_matter_id, token)
+        _sync_calendar_entries(conn, org_id, contact_id, clio_matter_id, token)
+        _sync_conversations(conn, org_id, clio_matter_id, token)
 
-    logger.info("Synced %d matter(s) for contact %s (org %s)", len(matters), contact_id, org_id)
+    logger.info("Full sync: %d matter(s) for contact %s (org %s)", len(matters), contact_id, org_id)
     return len(matters)
 
 
@@ -269,7 +453,7 @@ def _handle_scan(conn) -> dict:
                 contact_id = str(contact_row['contact_id'])
                 clio_contact_id = contact_row['clio_contact_id']
                 try:
-                    _sync_contact_matters(conn, org_id, contact_id, clio_contact_id, token)
+                    _sync_contact_all(conn, org_id, contact_id, clio_contact_id, token)
                 except RuntimeError as exc:
                     logger.error(
                         "Clio sync failed for org %s contact %s: %s",
@@ -365,7 +549,7 @@ def _handle_single_contact(conn, event: dict) -> dict:
         return {'mode': 'single', 'skipped': True, 'reason': 'no_clio_contact_id'}
 
     try:
-        count = _sync_contact_matters(conn, org_id, contact_id, clio_contact_id, token)
+        count = _sync_contact_all(conn, org_id, contact_id, clio_contact_id, token)
     except RuntimeError as exc:
         logger.error("Clio sync failed for org %s contact %s: %s", org_id, contact_id, exc)
         log_audit(conn, org_id, 'clio-sync', 'system.clio_sync_failed',
