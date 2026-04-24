@@ -31,6 +31,6 @@ def call_gemini(system_prompt: str, user_message: str, max_chars: int = 1600) ->
 
 def load_prompt_from_s3(practice_area: str, prompt_name: str = 'intake_v1') -> str:
     s3 = boto3.client('s3', region_name='us-east-2')
-    key = f"prompts/{practice_area}/{prompt_name}.txt"
+    key = f"prompts/{practice_area.lower().replace(' ', '_')}/{prompt_name}.txt"
     obj = s3.get_object(Bucket='firmos-documents-006619321854', Key=key)
     return obj['Body'].read().decode('utf-8')
