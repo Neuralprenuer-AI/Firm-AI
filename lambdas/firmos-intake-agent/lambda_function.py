@@ -76,6 +76,7 @@ def lambda_handler(event, context):
     conv_id = event['conversation_id']
     is_new_contact = event.get('is_new_contact', False)
     user_message = event.get('message', '')
+    conversation_state = event.get('conversation_state', 'intake_in_progress')
 
     try:
         conn = get_connection()
@@ -91,10 +92,10 @@ def lambda_handler(event, context):
             cur.execute(
                 "SELECT direction, body FROM firm_os.messages m "
                 "JOIN firm_os.conversations cv ON m.conversation_id = cv.conversation_id "
-                "WHERE m.conversation_id = %s AND cv.org_id = %s ORDER BY m.created_at ASC",
+                "WHERE m.conversation_id = %s AND cv.org_id = %s ORDER BY m.created_at DESC LIMIT 15",
                 (conv_id, org_id)
             )
-            history = cur.fetchall()
+            history = list(reversed(cur.fetchall()))
 
         with conn.cursor() as cur:
             cur.execute(
@@ -124,8 +125,25 @@ def lambda_handler(event, context):
             history = []
 
         system_prompt = load_prompt_from_s3(org['practice_area'])
+        if conversation_state == 'escalated':
+            system_prompt += (
+                "\n\nCONVERSATION STATUS: An attorney has already been notified about an urgent situation "
+                "in this conversation and will contact the client soon. "
+                "Do NOT escalate again. Do NOT send ESCALATE. "
+                "Answer any questions the client has naturally and helpfully. "
+                "If they ask about their situation, reassure them that an attorney is on the way. "
+                "Keep responses brief and warm."
+            )
         firm_name = org.get('name', 'the firm')
-        system_prompt += f"\n\nFIRM NAME: {firm_name}"
+        tz = org.get('timezone') or 'America/Chicago'
+        firm_context_lines = [
+            f"Firm name: {firm_name}",
+            f"Practice area: {org.get('practice_area', 'Law')}",
+            f"Timezone: {tz}",
+        ]
+        if org.get('after_hours_en'):
+            firm_context_lines.append(f"After-hours message (EN): {org['after_hours_en']}")
+        system_prompt += "\n\nFIRM CONTEXT:\n" + "\n".join(firm_context_lines)
         if is_new_contact:
             system_prompt += (
                 "\n\nNEW CLIENT: This is their very first message. "
@@ -228,6 +246,12 @@ def lambda_handler(event, context):
             return
 
         if 'ESCALATE' in reply:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE firm_os.conversations SET state = 'escalated' WHERE conversation_id = %s",
+                    (conv_id,)
+                )
+            conn.commit()
             _invoke('firmos-escalation', {
                 'org_id': org_id,
                 'contact_id': contact_id,
@@ -235,6 +259,14 @@ def lambda_handler(event, context):
                 'triggered_keyword': 'ai_detected',
                 'message_body': user_message
             })
+            holding = (
+                "An attorney has been notified about your situation and will contact you shortly. "
+                "If this is a life-threatening emergency, please call 911."
+                if language == 'en' else
+                "Un abogado ha sido notificado sobre su situación y se comunicará con usted pronto. "
+                "Si es una emergencia que amenaza su vida, llame al 911."
+            )
+            _split_and_send(org, conv_id, contact['phone'], holding)
             return
 
         with conn.cursor() as cur:
@@ -244,10 +276,19 @@ def lambda_handler(event, context):
         turn_count = tc['turn_count'] if tc else 0
 
         if turn_count >= 20:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE firm_os.conversations SET state = 'escalated' WHERE conversation_id = %s",
+                    (conv_id,)
+                )
+            conn.commit()
             _invoke('firmos-escalation', {
                 'org_id': org_id, 'contact_id': contact_id, 'conversation_id': conv_id,
                 'triggered_keyword': 'turn_limit_exceeded', 'message_body': user_message
             })
+            holding = ("An attorney will reach out to you directly." if language == 'en'
+                       else "Un abogado se comunicará con usted directamente.")
+            _split_and_send(org, conv_id, contact['phone'], holding)
             return
 
         # Warn client at turn 18 that they'll be connected to a person soon

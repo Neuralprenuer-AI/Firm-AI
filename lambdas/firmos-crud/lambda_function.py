@@ -589,6 +589,30 @@ def lambda_handler(event, context):
                 return _resp(403, {'error': 'forbidden'})
         return _resp(200, dict(row))
 
+    # PATCH /firmos/conversations/{id}/close
+    if path.startswith('/firmos/conversations/') and path.endswith('/close') and method == 'PATCH':
+        conv_id = params.get('id')
+        if not _valid_uuid(conv_id):
+            return _resp(400, {'error': 'invalid conversation id'})
+        with conn.cursor() as cur:
+            cur.execute("SELECT org_id FROM firm_os.conversations WHERE conversation_id = %s", (conv_id,))
+            row = cur.fetchone()
+        if not row:
+            return _resp(404, {'error': 'not found'})
+        if role == 'firm_admin':
+            try:
+                assert_org_access(caller_org_id, str(row['org_id']))
+            except PermissionError:
+                return _resp(403, {'error': 'forbidden'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE firm_os.conversations SET state = 'complete' WHERE conversation_id = %s RETURNING conversation_id",
+                (conv_id,)
+            )
+        conn.commit()
+        log_audit(conn, caller_org_id, claims.get('sub', 'unknown'), 'conversation.closed', {'conversation_id': conv_id})
+        return _resp(200, {'conversation_id': conv_id, 'state': 'complete'})
+
     # GET /firmos/intakes
     if path == '/firmos/intakes' and method == 'GET':
         if role != 'firm_admin':

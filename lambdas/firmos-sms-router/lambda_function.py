@@ -11,8 +11,8 @@ from shared_db import get_connection, log_audit
 STOP_KEYWORDS = ['stop', 'stopall', 'unsubscribe', 'cancel', 'end', 'quit']
 
 ESCALATION_KEYWORDS = [
-    'emergency', 'urgent', 'arrested', 'injured', 'dying',
-    'arrestado', 'detenido', 'ICE', 'herido', 'me llevaron', 'emergencia'
+    'emergency', 'urgent', 'arrest', 'injured', 'dying',
+    'deteni', 'ICE', 'herido', 'me llevaron', 'emergencia'
 ]
 
 def _invoke(name: str, payload: dict):
@@ -188,10 +188,16 @@ def lambda_handler(event, context):
         _send_sms(org, conv_id, from_phone, after_hours_msg)
         return
 
-    # Escalation keyword check — fires for any state
+    # Escalation keyword check — router owns state update + holding message, no race condition
     body_lower = body.lower()
     triggered = [kw for kw in ESCALATION_KEYWORDS if kw.lower() in body_lower]
-    if triggered:
+    if triggered and state != 'escalated':
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE firm_os.conversations SET state = 'escalated' WHERE conversation_id = %s",
+                (conv_id,)
+            )
+        conn.commit()
         _invoke('firmos-escalation', {
             'org_id': org_id,
             'contact_id': str(contact['contact_id']),
@@ -199,15 +205,40 @@ def lambda_handler(event, context):
             'triggered_keyword': triggered[0],
             'message_body': body
         })
+        lang = contact.get('preferred_language', 'en')
+        holding = (
+            "An attorney has been notified about your situation and will contact you shortly. "
+            "If this is a life-threatening emergency, please call 911."
+            if lang == 'en' else
+            "Un abogado ha sido notificado sobre su situación y se comunicará con usted pronto. "
+            "Si es una emergencia que amenaza su vida, llame al 911."
+        )
+        _send_sms(org, conv_id, from_phone, holding)
+        return
 
-    # Intake in progress — Gemini handles everything
-    if state == 'intake_in_progress':
-        _invoke('firmos-intake-agent', {
+    # Intake in progress or active — agent-core handles everything
+    if state in ('intake_in_progress', 'active'):
+        _invoke('firmos-agent-core', {
             'org_id': org_id,
             'contact_id': str(contact['contact_id']),
             'conversation_id': conv_id,
+            'user_message': body,
+            'contact_phone': from_phone,
             'is_new_contact': is_new_contact,
-            'message': body
+            'current_mode': 'intake',
+        })
+        return
+
+    # Escalated — agent-core answers naturally, knows attorney is already coming
+    if state == 'escalated':
+        _invoke('firmos-agent-core', {
+            'org_id': org_id,
+            'contact_id': str(contact['contact_id']),
+            'conversation_id': conv_id,
+            'user_message': body,
+            'contact_phone': from_phone,
+            'is_new_contact': False,
+            'current_mode': 'emergency',
         })
         return
 
