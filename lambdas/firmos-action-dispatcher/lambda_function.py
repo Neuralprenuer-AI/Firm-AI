@@ -279,6 +279,29 @@ def _invoke_escalation(
         logger.error("escalation invoke failed: %s", e)
 
 
+def _invoke_crm_push(
+    *, org_id: str, contact_id: str, intake_id: str, conversation_id: str
+) -> None:
+    if not intake_id:
+        logger.warning("crm-push skipped: no intake_id available")
+        return
+    payload = {
+        "org_id": org_id,
+        "contact_id": contact_id,
+        "intake_id": intake_id,
+        "conversation_id": conversation_id,
+    }
+    try:
+        _lambda_client.invoke(
+            FunctionName="firmos-crm-push",
+            InvocationType="Event",
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+        logger.info("crm-push invoked for intake_id=%s", intake_id)
+    except ClientError as e:
+        logger.error("crm-push invoke failed: %s", e)
+
+
 def _send_sms(*, org_id: str, to_phone: str, body: str, conversation_id: str, subaccount_token: Optional[str]) -> None:
     _lambda_client.invoke(
         FunctionName=TWILIO_SEND_FUNCTION,
@@ -379,6 +402,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             contact_phone=contact_phone,
             escalation=agent.escalation.model_dump(),
             intake_fields=fields_collected,
+        )
+
+    # 4b. CRM push — async-invoke on intake completion
+    if finalize_intake:
+        _invoke_crm_push(
+            org_id=org_id,
+            contact_id=contact_id,
+            intake_id=intake_id or "",
+            conversation_id=conversation_id,
         )
 
     # 5. Send SMS (twilio-send Lambda owns message persistence)
