@@ -202,7 +202,7 @@ def _sync_contact_matters(conn, org_id: str, contact_id: str, clio_contact_id: s
         f"{CLIO_API}/matters.json"
         f"?client_id={clio_contact_id}"
         f"&status=open"
-        f"&fields=id,display_number,description,status,practice_area,close_date,custom_field_values"
+        f"&fields=id,display_number,description,status,practice_area{{name}},close_date,custom_field_values{{field_name,value}}"
     )
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
