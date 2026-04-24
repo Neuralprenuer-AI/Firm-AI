@@ -405,11 +405,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         )
 
     # 4b. CRM push — async-invoke on intake completion
-    if finalize_intake:
+    if finalize_intake and intake_id:
         _invoke_crm_push(
             org_id=org_id,
             contact_id=contact_id,
-            intake_id=intake_id or "",
+            intake_id=intake_id,
             conversation_id=conversation_id,
         )
 
