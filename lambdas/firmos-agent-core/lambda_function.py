@@ -50,6 +50,7 @@ except Exception:
     genai_types = None
     _HAVE_GENAI_SDK = False
 
+import re
 import requests
 
 logger = logging.getLogger()
@@ -57,11 +58,11 @@ logger.setLevel(logging.INFO)
 
 GEMINI_SECRET_ID = "rcm/gemini/api-key"
 REGION = "us-east-2"
-GEMINI_MODEL_PRIMARY = "gemini-2.5-flash"
-GEMINI_MODEL_FALLBACK = "gemini-2.0-flash"
-GEMINI_TIMEOUT_SECS = 12
+GEMINI_MODEL_PRIMARY = "gemini-2.0-flash"
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
+GEMINI_TIMEOUT_SECS = 20
 GEMINI_TEMPERATURE = 0.4
-GEMINI_MAX_OUTPUT_TOKENS = 1024
+GEMINI_MAX_OUTPUT_TOKENS = 8192
 RECENT_MESSAGES_LIMIT = 15
 
 _secrets_client = boto3.client("secretsmanager", region_name=REGION)
@@ -200,6 +201,13 @@ def _load_recent_messages(conversation_id: str, limit: int) -> List[str]:
     return lines
 
 
+def _strip_json_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    return text.strip()
+
+
 def _build_gemini_schema() -> Dict[str, Any]:
     """Resolve all $ref inline so Gemini's responseSchema has no external refs."""
     schema = AgentResponse.model_json_schema()
@@ -258,20 +266,34 @@ def _call_gemini(*, system_prompt: str, user_message: str, model_name: str, api_
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_message}]}],
         "generationConfig": {
-            "response_mime_type": "application/json",
-            "response_schema": _get_gemini_schema(),
+            "responseMimeType": "application/json",
+            "responseSchema": _get_gemini_schema(),
             "temperature": GEMINI_TEMPERATURE,
             "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+            "thinkingConfig": {"thinkingBudget": 1024},
         },
     }
     r = requests.post(url, json=body, timeout=GEMINI_TIMEOUT_SECS)
-    if r.status_code == 429:
-        raise TimeoutError("Gemini 429 rate-limited")
+    if r.status_code in (429, 503):
+        raise TimeoutError(f"Gemini {r.status_code} — retrying next model")
     if r.status_code >= 400:
         raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:400]}")
     data = r.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        parts = data["candidates"][0]["content"]["parts"]
+        # Gemini 2.5 Flash returns thinking tokens as parts with thought=True;
+        # the actual JSON response is the last non-thought part.
+        text = None
+        for part in reversed(parts):
+            if not part.get("thought", False) and "text" in part:
+                text = part["text"]
+                break
+        if not text:
+            text = parts[0]["text"]
+        finish_reason = data["candidates"][0].get("finishReason", "")
+        if finish_reason == "MAX_TOKENS":
+            logger.warning("Gemini hit MAX_TOKENS — response may be truncated")
+        return text
     except (KeyError, IndexError, TypeError) as e:
         raise RuntimeError(f"Unexpected Gemini REST shape: {e} / {data}")
 
@@ -293,9 +315,9 @@ def _safe_handoff_response(*, detected_language: str = "en", reason: str = "agen
         confidence=0.0,
         detected_language=detected_language,
         client_messages=[msg],
-        state_update={"mode": "faq", "next_action": "handoff_human", "reasoning": f"Agent-core fallback: {reason}"},
+        state_update={"mode": "faq", "next_action": "continue", "reasoning": f"Agent-core fallback: {reason}"},
         intake_progress={"fields_collected": IntakeFields().model_dump(), "fields_remaining": [], "completion_percent": 0},
-        escalation={"triggered": True, "severity": "medium", "reason": reason, "attorney_summary": "SMS agent failure — please call this contact back to complete intake manually."},
+        escalation={"triggered": False, "severity": "none", "reason": None, "attorney_summary": None},
     )
     return resp.model_dump(mode="json")
 
@@ -364,7 +386,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             )
             latency_ms = int((time.time() - t0) * 1000)
             logger.info("gemini ok req=%s model=%s latency_ms=%d", request_id, model_name, latency_ms)
-            parsed = AgentResponse.model_validate(json.loads(raw))
+            parsed = AgentResponse.model_validate(json.loads(_strip_json_fences(raw)))
             agent_response = parsed.model_dump(mode="json")
             break
         except TimeoutError as e:
@@ -372,6 +394,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.warning("gemini timeout on %s: %s", model_name, e)
         except Exception as e:
             last_err = f"{type(e).__name__}_{model_name}:{e}"
+            try:
+                logger.error("gemini raw (first 500): %s", raw[:500] if 'raw' in dir() else "no raw")
+            except Exception:
+                pass
             logger.exception("gemini failure on %s", model_name)
 
     if agent_response is None:

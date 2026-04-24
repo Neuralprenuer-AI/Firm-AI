@@ -293,20 +293,6 @@ def _send_sms(*, org_id: str, to_phone: str, body: str, conversation_id: str, su
     )
 
 
-def _persist_outbound_message(*, org_id: str, conversation_id: str, body: str) -> None:
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO firm_os.messages
-                (message_id, org_id, conversation_id, direction, body, created_at)
-            VALUES (%s, %s, %s, 'outbound', %s, now())
-            """,
-            (str(uuid.uuid4()), org_id, conversation_id, body),
-        )
-    conn.commit()
-
-
 def _bump_turn_count(conversation_id: str, org_id: str) -> None:
     conn = get_connection()
     with conn.cursor() as cur:
@@ -395,7 +381,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             intake_fields=fields_collected,
         )
 
-    # 5+6. Send SMS + persist outbound
+    # 5. Send SMS (twilio-send Lambda owns message persistence)
     send_errors: List[str] = []
     for body in messages_out:
         try:
@@ -406,14 +392,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 conversation_id=conversation_id,
                 subaccount_token=org_secret.get("twilio_auth_token"),
             )
-            _persist_outbound_message(
-                org_id=org_id,
-                conversation_id=conversation_id,
-                body=body,
-            )
         except Exception as e:
             send_errors.append(str(e))
-            logger.exception("sms send/persist failed")
+            logger.exception("sms send failed")
 
     # 7. Turn count
     try:
