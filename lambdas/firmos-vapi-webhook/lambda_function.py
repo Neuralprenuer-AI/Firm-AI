@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -16,10 +17,11 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 REGION = 'us-east-2'
-EMERGENCY_KEYWORDS = [
-    'emergency', 'arrested', 'ice', 'injured', 'dying', 'urgent',
-    'emergencia', 'arrestado', 'detenido', 'herido',
-]
+EMERGENCY_PATTERNS = [re.compile(p) for p in [
+    r'\bemergency\b', r'\barrested\b', r'\bice\b', r'\binjured\b',
+    r'\bdying\b', r'\burgent\b',
+    r'\bemergencia\b', r'\barrestado\b', r'\bdetenido\b', r'\bherido\b',
+]]
 
 _secret_cache: dict = {}
 
@@ -46,25 +48,22 @@ def _verify_signature(body_bytes: bytes, signature: str, secret: str) -> bool:
 
 
 def _find_or_create_contact(conn, org_id: str, phone: str) -> str:
-    if not phone:
-        return str(uuid.uuid4())
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT contact_id FROM firm_os.contacts WHERE org_id = %s AND phone = %s",
-            (org_id, phone),
-        )
-        row = cur.fetchone()
-
-    if row:
-        return str(row['contact_id'])
+    if phone:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT contact_id FROM firm_os.contacts WHERE org_id = %s AND phone = %s",
+                (org_id, phone),
+            )
+            row = cur.fetchone()
+        if row:
+            return str(row['contact_id'])
 
     contact_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO firm_os.contacts (contact_id, org_id, phone, status, created_at) "
             "VALUES (%s, %s, %s, 'active', NOW())",
-            (contact_id, org_id, phone),
+            (contact_id, org_id, phone or None),
         )
     conn.commit()
     return contact_id
@@ -73,7 +72,7 @@ def _find_or_create_contact(conn, org_id: str, phone: str) -> str:
 def _contains_emergency(transcript: list) -> bool:
     for turn in transcript:
         text = (turn.get('message') or '').lower()
-        if any(kw in text for kw in EMERGENCY_KEYWORDS):
+        if any(p.search(text) for p in EMERGENCY_PATTERNS):
             return True
     return False
 
@@ -90,8 +89,11 @@ def lambda_handler(event, context):
         if signature and not _verify_signature(body_bytes, signature, secret):
             logger.warning("Invalid ElevenLabs webhook signature")
             return _resp(401, {'error': 'invalid_signature'})
+    except KeyError:
+        logger.error("Secrets Manager key missing — cannot verify signature, rejecting")
+        return _resp(500, {'error': 'secret_configuration_error'})
     except Exception as exc:
-        logger.error("Signature check failed: %s", exc)
+        logger.warning("Signature check failed (non-fatal): %s", exc)
 
     try:
         payload = json.loads(body_str)
@@ -144,17 +146,22 @@ def lambda_handler(event, context):
         )
     conn.commit()
 
-    # Insert transcript turns as messages
-    for turn in transcript:
-        direction = 'outbound' if turn.get('role') == 'agent' else 'inbound'
+    # Insert transcript turns as messages (batch)
+    if transcript:
+        message_rows = [
+            (org_id, conv_id,
+             'outbound' if turn.get('role') == 'agent' else 'inbound',
+             turn.get('message', ''))
+            for turn in transcript
+        ]
         with conn.cursor() as cur:
-            cur.execute(
+            cur.executemany(
                 "INSERT INTO firm_os.messages "
                 "(org_id, conversation_id, direction, body, created_at) "
                 "VALUES (%s, %s, %s, %s, NOW())",
-                (org_id, conv_id, direction, turn.get('message', '')),
+                message_rows,
             )
-    conn.commit()
+        conn.commit()
 
     if escalated:
         try:
