@@ -1,3 +1,6 @@
+BEGIN;
+SET search_path TO firm_os, public;
+
 -- migrations/022_voice_receptionist.sql
 
 -- Rename vapi_assistant_id → elevenlabs_agent_id (conditional)
@@ -19,3 +22,5 @@ END $$;
 -- Add ElevenLabs voice ID column
 ALTER TABLE firm_os.organizations
     ADD COLUMN IF NOT EXISTS elevenlabs_voice_id TEXT DEFAULT '21m00Tcm4TlvDq8ikWAM';
+
+COMMIT;
