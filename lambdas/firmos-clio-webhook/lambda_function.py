@@ -19,7 +19,7 @@ def _resp(status: int, body: dict, extra_headers: dict | None = None) -> dict:
 
 
 def _verify_signature(body_bytes: bytes, signature: str, secret: str) -> bool:
-    expected = hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+    expected = hmac.HMAC(secret.encode(), body_bytes, digestmod=hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 
 
@@ -47,6 +47,8 @@ def _upsert_matter_event(conn, org_id: str, event_data: dict) -> None:
                WHERE org_id = %s AND clio_matter_id = %s""",
             (status, description, org_id, clio_matter_id)
         )
+        if cur.rowcount == 0:
+            logger.warning("matter webhook: no cache row for org=%s matter=%s — will sync on next poll", org_id, clio_matter_id)
     conn.commit()
     logger.info("matter webhook upsert: org=%s matter=%s status=%s", org_id, clio_matter_id, status)
 
@@ -153,7 +155,7 @@ def lambda_handler(event, context):
 
     # Clio handshake
     hook_secret_header = headers.get('x-hook-secret')
-    if hook_secret_header:
+    if hook_secret_header and len(hook_secret_header) <= 256:
         logger.info("Clio webhook handshake received")
         return _resp(200, {'status': 'handshake_ok'}, {'X-Hook-Secret': hook_secret_header})
 
@@ -181,9 +183,9 @@ def lambda_handler(event, context):
     hook_secret = sub.get('hook_secret') or ''
 
     signature = headers.get('x-hook-signature', '')
-    if hook_secret and signature:
-        if not _verify_signature(body_bytes, signature, hook_secret):
-            logger.warning("Invalid signature for org=%s webhook=%s", org_id, webhook_id)
+    if hook_secret:
+        if not signature or not _verify_signature(body_bytes, signature, hook_secret):
+            logger.warning("Missing or invalid signature for org=%s webhook=%s", org_id, webhook_id)
             log_audit(conn, org_id, 'clio-webhook', 'system.webhook_invalid_signature',
                       {'webhook_id': webhook_id}, severity='warning')
             return _resp(401, {'error': 'invalid_signature'})
@@ -193,6 +195,10 @@ def lambda_handler(event, context):
         try:
             handler(conn, org_id, event_data)
         except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             logger.error("Webhook handler error org=%s model=%s: %s", org_id, model, exc)
             log_audit(conn, org_id, 'clio-webhook', 'system.webhook_handler_error',
                       {'model': model, 'event': event_type, 'error': str(exc)}, severity='warning')
