@@ -81,19 +81,20 @@ def lambda_handler(event, context):
     body_str = event.get('body') or ''
     body_bytes = body_str.encode()
 
-    # Verify ElevenLabs HMAC signature (skip if header absent — dev/test mode)
+    # Verify ElevenLabs HMAC signature — required in all environments
     try:
         secret = _get_secret('firmos/voice/webhook-secret')['secret']
         headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}
         signature = headers.get('x-elevenlabs-signature', '')
-        if signature and not _verify_signature(body_bytes, signature, secret):
-            logger.warning("Invalid ElevenLabs webhook signature")
+        if not signature or not _verify_signature(body_bytes, signature, secret):
+            logger.warning("Missing or invalid ElevenLabs webhook signature")
             return _resp(401, {'error': 'invalid_signature'})
     except KeyError:
         logger.error("Secrets Manager key missing — cannot verify signature, rejecting")
         return _resp(500, {'error': 'secret_configuration_error'})
     except Exception as exc:
-        logger.warning("Signature check failed (non-fatal): %s", exc)
+        logger.error("Signature check failed: %s", exc)
+        return _resp(500, {'error': 'signature_check_error'})
 
     try:
         payload = json.loads(body_str)
@@ -112,22 +113,26 @@ def lambda_handler(event, context):
     custom_data = (data.get('conversation_initiation_client_data') or {}).get('custom_llm_extra_body', {})
     caller_phone = metadata.get('caller_id', '')
 
-    # Resolve org — prefer org_id from call-time injection, fall back to agent_id lookup
-    org_id = custom_data.get('org_id')
     conn = get_connection()
 
-    if not org_id:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT org_id FROM firm_os.organizations "
-                "WHERE elevenlabs_agent_id = %s AND status = 'active'",
-                (agent_id,),
-            )
-            row = cur.fetchone()
-        if not row:
-            logger.error("No org found for agent_id %s", agent_id)
-            return _resp(404, {'error': 'org_not_found'})
-        org_id = str(row['org_id'])
+    # Resolve org from DB via agent_id — authoritative source
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT org_id FROM firm_os.organizations "
+            "WHERE elevenlabs_agent_id = %s AND status = 'active'",
+            (agent_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        logger.error("No org found for agent_id %s", agent_id)
+        return _resp(404, {'error': 'org_not_found'})
+    org_id = str(row['org_id'])
+
+    # Cross-validate caller-supplied org_id if present
+    supplied_org_id = custom_data.get('org_id')
+    if supplied_org_id and supplied_org_id != org_id:
+        logger.warning("org_id mismatch: agent resolves to %s but caller sent %s", org_id, supplied_org_id)
+        return _resp(403, {'error': 'org_id_mismatch'})
 
     contact_id = _find_or_create_contact(conn, org_id, caller_phone)
 

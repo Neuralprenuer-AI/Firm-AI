@@ -41,6 +41,7 @@ def test_unauthorized_returns_401():
 
 def test_lookup_caller_new_client():
     with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function._validate_org', return_value=True), \
          patch('lambda_function.get_connection') as mock_get_conn:
         mock_get_conn.return_value = _mock_conn(fetchone_return=None)
         from lambda_function import lambda_handler
@@ -67,6 +68,7 @@ def test_lookup_caller_existing_client():
     }
 
     with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function._validate_org', return_value=True), \
          patch('lambda_function.get_connection') as mock_get_conn:
         mock_cursor = MagicMock()
         mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
@@ -89,6 +91,7 @@ def test_lookup_caller_existing_client():
 
 def test_check_availability_returns_open_slots():
     with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function._validate_org', return_value=True), \
          patch('lambda_function.get_connection') as mock_get_conn:
         mock_get_conn.return_value = _mock_conn(fetchall_return=[])
         from lambda_function import lambda_handler
@@ -99,9 +102,19 @@ def test_check_availability_returns_open_slots():
     assert body['booked_slots'] == []
 
 
+def test_validate_org_rejects_unknown_org():
+    with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function._validate_org', return_value=False), \
+         patch('lambda_function.get_connection'):
+        from lambda_function import lambda_handler
+        result = lambda_handler(_event('GET', '/firmos/voice/caller', 'phone=%2B1234&org_id=bad-org'), None)
+    assert result['statusCode'] == 403
+
+
 def test_escalate_transfer_returns_phone():
     org = {'emergency_contact_number': '+19365551234'}
     with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function._validate_org', return_value=True), \
          patch('lambda_function.get_connection') as mock_get_conn, \
          patch('lambda_function.boto3') as mock_boto:
         mock_cursor = MagicMock()
@@ -124,6 +137,7 @@ def test_escalate_transfer_returns_phone():
 
 def test_complete_intake_creates_new_contact():
     with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function._validate_org', return_value=True), \
          patch('lambda_function.get_connection') as mock_get_conn, \
          patch('lambda_function.boto3'):
         mock_cursor = MagicMock()
@@ -152,6 +166,7 @@ def test_complete_intake_creates_new_contact():
 
 def test_book_appointment_writes_db_even_if_clio_fails():
     with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function._validate_org', return_value=True), \
          patch('lambda_function.get_connection') as mock_get_conn, \
          patch('lambda_function.requests.post') as mock_post:
         mock_post.side_effect = Exception("Clio timeout")

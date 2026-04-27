@@ -1,4 +1,5 @@
 # lambdas/firmos-voice-tools/lambda_function.py
+import hmac
 import json
 import logging
 import sys
@@ -43,10 +44,19 @@ def _verify_secret(event: dict) -> bool:
     provided = headers.get('x-voice-secret', '')
     try:
         expected = _get_secret('firmos/voice/webhook-secret')['secret']
-        return provided == expected
+        return hmac.compare_digest(provided.encode(), expected.encode())
     except Exception as exc:
         logger.error("Secret fetch failed: %s", exc)
         return False
+
+
+def _validate_org(conn, org_id: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM firm_os.organizations WHERE org_id = %s AND status = 'active'",
+            (org_id,),
+        )
+        return cur.fetchone() is not None
 
 
 def handle_lookup_caller(conn, params: dict) -> dict:
@@ -54,6 +64,8 @@ def handle_lookup_caller(conn, params: dict) -> dict:
     org_id = (params.get('org_id') or '').strip()
     if not phone or not org_id:
         return _resp(400, {'error': 'phone and org_id required'})
+    if not _validate_org(conn, org_id):
+        return _resp(403, {'error': 'invalid org_id'})
 
     with conn.cursor() as cur:
         cur.execute(
@@ -116,6 +128,8 @@ def handle_complete_intake(conn, body: dict) -> dict:
 
     if not all([org_id, phone, name, issue]):
         return _resp(400, {'error': 'org_id, phone, name, issue required'})
+    if not _validate_org(conn, org_id):
+        return _resp(403, {'error': 'invalid org_id'})
 
     with conn.cursor() as cur:
         cur.execute(
@@ -190,6 +204,8 @@ def handle_check_availability(conn, params: dict) -> dict:
 
     if not org_id or not date_str:
         return _resp(400, {'error': 'org_id and date required'})
+    if not _validate_org(conn, org_id):
+        return _resp(403, {'error': 'invalid org_id'})
 
     try:
         target_date = date.fromisoformat(date_str)
@@ -226,6 +242,8 @@ def handle_book_appointment(conn, body: dict) -> dict:
 
     if not all([org_id, contact_id, start_at, end_at]):
         return _resp(400, {'error': 'org_id, contact_id, start_at, end_at required'})
+    if not _validate_org(conn, org_id):
+        return _resp(403, {'error': 'invalid org_id'})
 
     with conn.cursor() as cur:
         cur.execute(
@@ -301,6 +319,8 @@ def handle_escalate_transfer(conn, body: dict) -> dict:
 
     if not org_id:
         return _resp(400, {'error': 'org_id required'})
+    if not _validate_org(conn, org_id):
+        return _resp(403, {'error': 'invalid org_id'})
 
     with conn.cursor() as cur:
         cur.execute(
