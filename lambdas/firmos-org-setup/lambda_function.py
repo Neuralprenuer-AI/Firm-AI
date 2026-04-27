@@ -470,6 +470,10 @@ def _provision_elevenlabs_agent(
         logger.warning("Could not load voice webhook secret — skipping voice: %s", exc)
         return None
 
+    if not webhook_secret:
+        logger.warning("Voice webhook secret is empty — skipping voice")
+        return None
+
     firm_name = event['firm_name']
     practice_area = event['practice_area'].replace('_', ' ').title()
     agent_name = event.get('agent_display_name', 'Alex')
@@ -513,15 +517,19 @@ def _provision_elevenlabs_agent(
         },
     }
 
-    create_resp = requests.post(
-        f'{ELEVENLABS_API}/conversational_ai/agents',
-        headers={'xi-api-key': api_key, 'Content-Type': 'application/json'},
-        json=agent_payload,
-        timeout=20,
-    )
+    try:
+        create_resp = requests.post(
+            f'{ELEVENLABS_API}/conversational_ai/agents',
+            headers={'xi-api-key': api_key, 'Content-Type': 'application/json'},
+            json=agent_payload,
+            timeout=20,
+        )
+    except Exception as exc:
+        logger.warning("ElevenLabs agent create network error — skipping voice: %s", exc)
+        return None
 
     if create_resp.status_code not in (200, 201):
-        logger.warning("ElevenLabs agent create failed %s: %s", create_resp.status_code, create_resp.text[:300])
+        logger.warning("ElevenLabs agent create failed status=%s", create_resp.status_code)
         return None
 
     agent_id = create_resp.json().get('agent_id')
@@ -543,7 +551,7 @@ def _provision_elevenlabs_agent(
             timeout=20,
         )
         if phone_resp.status_code not in (200, 201):
-            logger.warning("ElevenLabs phone import failed %s: %s", phone_resp.status_code, phone_resp.text[:200])
+            logger.warning("ElevenLabs phone import failed status=%s", phone_resp.status_code)
     except Exception as exc:
         logger.warning("ElevenLabs phone import exception: %s", exc)
 
@@ -730,7 +738,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 email_sent = True
             except Exception:
                 logger.warning(
-                    "Step 7 (welcome_email) failed — continuing. org_id=%s partner=%s",
+                    "Step 8 (welcome_email) failed — continuing. org_id=%s partner=%s",
                     org_id,
                     event['partner_email'],
                     exc_info=True,
