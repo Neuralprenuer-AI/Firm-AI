@@ -32,6 +32,111 @@ _SMS_WEBHOOK_URL = (
 
 _PILOT_AREA_CODES = ('832', '713')
 
+ELEVENLABS_API = 'https://api.elevenlabs.io/v1'
+VOICE_TOOLS_BASE = 'https://kezjhodcig.execute-api.us-east-2.amazonaws.com/prod/firmos/voice'
+
+_SYSTEM_PROMPT_TEMPLATE = """You are {agent_name}, the AI receptionist for {firm_name}, a {practice_area} law firm.
+
+MANDATORY DISCLAIMER: At the start of every call, state: "I'm an AI assistant, not an attorney. No attorney-client relationship is formed until confirmed in writing by a licensed attorney."
+
+YOUR ROLE:
+- New callers: Collect intake information (issue, date, name, has attorney).
+- Existing clients: Provide case status and upcoming appointment info.
+- Appointment requests: Check availability and book.
+- Emergencies or attorney requests: Transfer immediately.
+
+HARD RULES:
+- Never give legal advice, cite case law, predict outcomes, or discuss fees.
+- Escalate immediately for: arrest, detention, ICE, injury, imminent court date, explicit attorney request.
+- Do NOT escalate for: general questions, past events, scheduling, routine follow-up.
+
+LANGUAGE: English by default. Switch to Spanish mid-call if caller speaks Spanish.
+
+FIRM: {firm_name} | Practice: {practice_area} | Timezone: {timezone}
+"""
+
+_TOOLS_CONFIG = [
+    {
+        "name": "lookup_caller",
+        "description": "Look up whether this phone number is an existing client. Returns case status and upcoming appointments.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "phone": {"type": "string", "description": "Caller phone number in E.164 format"},
+                "org_id": {"type": "string", "description": "Organization ID"},
+            },
+            "required": ["phone", "org_id"],
+        },
+        "url": f"{VOICE_TOOLS_BASE}/caller",
+        "method": "GET",
+    },
+    {
+        "name": "complete_intake",
+        "description": "Record a completed intake for a new client. Call when you have collected all 4 fields: issue, incident date, name, has attorney.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "org_id": {"type": "string"},
+                "phone": {"type": "string"},
+                "name": {"type": "string"},
+                "issue": {"type": "string"},
+                "incident_date": {"type": "string"},
+                "has_attorney": {"type": "boolean"},
+                "language": {"type": "string", "enum": ["en", "es"]},
+            },
+            "required": ["org_id", "phone", "name", "issue"],
+        },
+        "url": f"{VOICE_TOOLS_BASE}/intake",
+        "method": "POST",
+    },
+    {
+        "name": "check_availability",
+        "description": "Check what appointment slots are available on a given date.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "org_id": {"type": "string"},
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD format"},
+            },
+            "required": ["org_id", "date"],
+        },
+        "url": f"{VOICE_TOOLS_BASE}/availability",
+        "method": "GET",
+    },
+    {
+        "name": "book_appointment",
+        "description": "Book an appointment for a client in the firm's calendar.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "org_id": {"type": "string"},
+                "contact_id": {"type": "string"},
+                "summary": {"type": "string"},
+                "start_at": {"type": "string", "description": "ISO-8601 UTC datetime"},
+                "end_at": {"type": "string", "description": "ISO-8601 UTC datetime"},
+            },
+            "required": ["org_id", "contact_id", "summary", "start_at", "end_at"],
+        },
+        "url": f"{VOICE_TOOLS_BASE}/appointment",
+        "method": "POST",
+    },
+    {
+        "name": "escalate_transfer",
+        "description": "Get the on-call attorney phone number for live transfer. Use for emergencies or when caller explicitly asks for an attorney.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "org_id": {"type": "string"},
+                "contact_id": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["org_id", "reason"],
+        },
+        "url": f"{VOICE_TOOLS_BASE}/escalate",
+        "method": "POST",
+    },
+]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -332,7 +437,122 @@ def _activate_org(conn: Any, org_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 7: Send welcome email via SES (non-fatal)
+# Step 7: Provision ElevenLabs ConvAI agent (non-fatal)
+# ---------------------------------------------------------------------------
+
+def _provision_elevenlabs_agent(
+    sm_client: Any,
+    org_id: str,
+    event: dict[str, Any],
+    twilio_phone_number: str,
+    sub_sid: str,
+    sub_token: str,
+) -> 'str | None':
+    """
+    Creates an ElevenLabs ConvAI agent for this firm.
+    Returns agent_id or None if provisioning fails (non-fatal).
+    """
+    try:
+        el_secret = json.loads(
+            sm_client.get_secret_value(SecretId='firmos/elevenlabs/api-key')['SecretString']
+        )
+        api_key = el_secret['api_key']
+    except Exception as exc:
+        logger.warning("Could not load ElevenLabs API key — skipping voice: %s", exc)
+        return None
+
+    try:
+        voice_secret = json.loads(
+            sm_client.get_secret_value(SecretId='firmos/voice/webhook-secret')['SecretString']
+        )
+        webhook_secret = voice_secret['secret']
+    except Exception as exc:
+        logger.warning("Could not load voice webhook secret — skipping voice: %s", exc)
+        return None
+
+    firm_name = event['firm_name']
+    practice_area = event['practice_area'].replace('_', ' ').title()
+    agent_name = event.get('agent_display_name', 'Alex')
+    timezone = event.get('timezone', 'America/Chicago')
+
+    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+        agent_name=agent_name,
+        firm_name=firm_name,
+        practice_area=practice_area,
+        timezone=timezone,
+    )
+
+    tools_with_auth = []
+    for tool in _TOOLS_CONFIG:
+        tools_with_auth.append({
+            **tool,
+            "headers": {"X-Voice-Secret": webhook_secret},
+        })
+
+    agent_payload = {
+        "name": f"{firm_name} Receptionist",
+        "conversation_config": {
+            "agent": {
+                "prompt": {
+                    "prompt": system_prompt,
+                    "tools": tools_with_auth,
+                },
+                "first_message": (
+                    f"Thank you for calling {firm_name}. I'm {agent_name}, the AI receptionist. "
+                    "I'm not an attorney — no attorney-client relationship is formed until confirmed "
+                    "in writing by a licensed attorney. How can I help you today?"
+                ),
+                "language": "en",
+            },
+            "tts": {"voice_id": "21m00Tcm4TlvDq8ikWAM"},
+        },
+        "platform_settings": {
+            "webhook": {
+                "url": "https://kezjhodcig.execute-api.us-east-2.amazonaws.com/prod/firmos/voice/webhook",
+            }
+        },
+    }
+
+    create_resp = requests.post(
+        f'{ELEVENLABS_API}/conversational_ai/agents',
+        headers={'xi-api-key': api_key, 'Content-Type': 'application/json'},
+        json=agent_payload,
+        timeout=20,
+    )
+
+    if create_resp.status_code not in (200, 201):
+        logger.warning("ElevenLabs agent create failed %s: %s", create_resp.status_code, create_resp.text[:300])
+        return None
+
+    agent_id = create_resp.json().get('agent_id')
+    if not agent_id:
+        logger.warning("ElevenLabs agent_id missing from response")
+        return None
+
+    # Link Twilio phone number to this agent in ElevenLabs
+    try:
+        phone_resp = requests.post(
+            f'{ELEVENLABS_API}/conversational_ai/phone_numbers',
+            headers={'xi-api-key': api_key, 'Content-Type': 'application/json'},
+            json={
+                'phone_number': twilio_phone_number,
+                'label': f'{firm_name} intake',
+                'sid': sub_sid,
+                'token': sub_token,
+            },
+            timeout=20,
+        )
+        if phone_resp.status_code not in (200, 201):
+            logger.warning("ElevenLabs phone import failed %s: %s", phone_resp.status_code, phone_resp.text[:200])
+    except Exception as exc:
+        logger.warning("ElevenLabs phone import exception: %s", exc)
+
+    logger.info("ElevenLabs agent provisioned agent_id=%s for org=%s", agent_id, org_id)
+    return agent_id
+
+
+# ---------------------------------------------------------------------------
+# Step 8: Send welcome email via SES (non-fatal)
 # ---------------------------------------------------------------------------
 
 def _send_welcome_email(
@@ -481,7 +701,27 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return _fail(conn, org_id, 'activate_org', str(exc))
 
         # ------------------------------------------------------------------
-        # Step 7: Send welcome email (non-fatal)
+        # Step 7: Provision ElevenLabs voice agent (non-fatal)
+        # ------------------------------------------------------------------
+        agent_id = _provision_elevenlabs_agent(
+            sm_client, org_id, event, twilio_phone_number, sub_sid, sub_token
+        )
+        if agent_id:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE firm_os.organizations SET elevenlabs_agent_id = %s WHERE org_id = %s",
+                        (agent_id, org_id),
+                    )
+                conn.commit()
+                logger.info("elevenlabs_agent_id stored org=%s agent=%s", org_id, agent_id)
+            except Exception as exc:
+                logger.warning("Failed to store agent_id org=%s: %s", org_id, exc)
+        else:
+            logger.warning("Voice not provisioned for org=%s — manual setup required", org_id)
+
+        # ------------------------------------------------------------------
+        # Step 8: Send welcome email (non-fatal)
         # ------------------------------------------------------------------
         email_sent = False
         if sender_address:
@@ -501,7 +741,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             )
 
         # ------------------------------------------------------------------
-        # Step 8: Audit log (best effort)
+        # Step 9: Audit log (best effort)
         # ------------------------------------------------------------------
         try:
             log_audit(
@@ -518,7 +758,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 },
             )
         except Exception:
-            logger.warning("Step 8 (audit_log) failed — non-fatal org_id=%s", org_id, exc_info=True)
+            logger.warning("Step 9 (audit_log) failed — non-fatal org_id=%s", org_id, exc_info=True)
 
         # ------------------------------------------------------------------
         # Success
@@ -532,6 +772,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             'org_id': org_id,
             'firm_name': event['firm_name'],
             'twilio_phone_number': twilio_phone_number,
+            'elevenlabs_agent_id': agent_id,
             'status': 'active',
             'message': f'Firm onboarded successfully. {email_note}',
         })
