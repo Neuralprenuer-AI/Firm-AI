@@ -54,7 +54,7 @@ def _get_clio_context(conn, org_id, contact_id):
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT matter_display_number, matter_status, notes_text,
-                          responsible_attorney_name, open_date, close_date
+                          responsible_attorney_name, open_date
                    FROM firm_os.case_status_cache
                    WHERE org_id = %s AND contact_id = %s
                    ORDER BY last_synced_at DESC NULLS LAST LIMIT 1""",
@@ -113,7 +113,8 @@ def _get_clio_context(conn, org_id, contact_id):
         if not parts:
             return "No open matters found in case management system."
         return ' | '.join(parts)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_get_clio_context failed org=%s contact=%s: %s", org_id, contact_id, exc)
         return None
 
 def lambda_handler(event, context):
