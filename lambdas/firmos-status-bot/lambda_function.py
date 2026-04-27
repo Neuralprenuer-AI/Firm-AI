@@ -1,17 +1,13 @@
 import json
 import re
-import os
 import boto3
-import requests
 import sys
-from datetime import datetime, timezone
 sys.path.insert(0, '/opt/python')
 
 from shared_db import get_connection, log_audit
 from shared_ai import call_gemini, load_prompt_from_s3
 
-CLIO_API = 'https://app.clio.com/api/v4'
-REGION = os.environ.get('AWS_REGION', 'us-east-2')
+REGION = 'us-east-2'
 SMS_CHAR_LIMIT = 320
 
 def _invoke_send(org, conv_id, to_phone, body):
@@ -48,41 +44,75 @@ def _split_and_send(org, conv_id, to_phone, text):
         _invoke_send(org, conv_id, to_phone, chunk)
 
 
-def _clio_token_valid(org):
-    expires = org.get('clio_token_expires_at')
-    if not expires:
-        return False
-    if isinstance(expires, str):
-        try:
-            expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-        except ValueError:
-            return False
-    return expires > datetime.now(timezone.utc)
 
-
-def _get_clio_context(clio_token, clio_contact_id):
-    if not clio_token or not clio_contact_id:
-        return None
+def _get_clio_context(conn, org_id, contact_id):
+    """Build rich context from case_status_cache + Phase 4 tables."""
     try:
-        resp = requests.get(
-            f"{CLIO_API}/matters",
-            headers={'Authorization': f'Bearer {clio_token}'},
-            params={
-                'contact_id': clio_contact_id,
-                'status': 'open',
-                'fields': 'id,display_number,description,status,practice_area,close_date,custom_field_values'
-            },
-            timeout=10
-        )
-        if resp.status_code == 200:
-            matters = resp.json().get('data', [])
-            if matters:
-                m = matters[0]
-                area = (m.get('practice_area') or {}).get('name', 'Unknown')
-                desc = m.get('description') or m.get('display_number', '')
-                close = m.get('close_date', '')
-                return f"Matter: {area} — {desc}. Status: open.{' Close date: ' + close if close else ''}"
-        return "No open matters found in case management system."
+        parts = []
+
+        # Matter status from existing cache
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT matter_display_number, matter_status, notes_text,
+                          responsible_attorney_name, open_date, close_date
+                   FROM firm_os.case_status_cache
+                   WHERE org_id = %s AND contact_id = %s
+                   ORDER BY last_synced_at DESC NULLS LAST LIMIT 1""",
+                (org_id, contact_id),
+            )
+            matter = cur.fetchone()
+        if matter:
+            matter_line = f"Matter: {matter['matter_display_number']} — Status: {matter['matter_status']}"
+            if matter.get('responsible_attorney_name'):
+                matter_line += f" | Attorney: {matter['responsible_attorney_name']}"
+            if matter.get('open_date'):
+                matter_line += f" | Opened: {matter['open_date']}"
+            parts.append(matter_line)
+
+        # Upcoming calendar entries (court dates, appointments)
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT summary, start_at FROM firm_os.clio_calendar_entries
+                   WHERE org_id = %s AND contact_id = %s AND start_at > NOW()
+                   ORDER BY start_at ASC LIMIT 3""",
+                (org_id, contact_id),
+            )
+            entries = cur.fetchall()
+        for e in entries:
+            date_str = e['start_at'].strftime('%B %d, %Y') if e.get('start_at') else 'TBD'
+            parts.append(f"Upcoming: {e['summary']} on {date_str}")
+
+        # Recent notes
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT subject, detail FROM firm_os.clio_notes
+                   WHERE org_id = %s AND contact_id = %s
+                   ORDER BY synced_at DESC LIMIT 2""",
+                (org_id, contact_id),
+            )
+            notes = cur.fetchall()
+        for n in notes:
+            if n.get('detail'):
+                subj = (n.get('subject') or '')[:40]
+                parts.append(f"Note ({subj}): {n['detail'][:200]}")
+
+        # Recent communications
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT subject, body FROM firm_os.clio_communications
+                   WHERE org_id = %s AND contact_id = %s
+                   ORDER BY received_at DESC LIMIT 2""",
+                (org_id, contact_id),
+            )
+            comms = cur.fetchall()
+        for c in comms:
+            if c.get('body'):
+                subj = (c.get('subject') or '')[:40]
+                parts.append(f"Comm ({subj}): {c['body'][:200]}")
+
+        if not parts:
+            return "No open matters found in case management system."
+        return ' | '.join(parts)
     except Exception:
         return None
 
@@ -144,9 +174,8 @@ def lambda_handler(event, context):
         if not client_name and history_text:
             intake_summary = history_text[-800:]  # last 800 chars of intake
 
-    # Pull Clio case context — only if token is still valid
-    clio_token = org.get('clio_access_token') if _clio_token_valid(org) else None
-    clio_context = _get_clio_context(clio_token, contact.get('clio_contact_id'))
+    # Pull Clio case context from sync cache (no live Clio call needed)
+    clio_context = _get_clio_context(conn, org_id, contact_id)
 
     # Load status prompt (falls back to intake prompt if status_v1 not found)
     try:
