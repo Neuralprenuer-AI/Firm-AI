@@ -130,8 +130,8 @@ def handle_complete_intake(conn, body: dict) -> dict:
             cur.execute(
                 "UPDATE firm_os.contacts SET "
                 "name = COALESCE(%s, name), preferred_language = %s "
-                "WHERE contact_id = %s",
-                (name or None, language, contact_id),
+                "WHERE org_id = %s AND contact_id = %s",
+                (name or None, language, org_id, contact_id),
             )
         conn.commit()
     else:

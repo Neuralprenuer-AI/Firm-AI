@@ -120,3 +120,69 @@ def test_escalate_transfer_returns_phone():
     body = json.loads(result['body'])
     assert result['statusCode'] == 200
     assert body['transfer_to'] == '+19365551234'
+
+
+def test_complete_intake_creates_new_contact():
+    with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function.get_connection') as mock_get_conn, \
+         patch('lambda_function.boto3'):
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.fetchone.return_value = None
+        conn = MagicMock()
+        conn.cursor.return_value = mock_cursor
+        mock_get_conn.return_value = conn
+
+        from lambda_function import lambda_handler
+        result = lambda_handler(_event('POST', '/firmos/voice/intake', body={
+            'org_id': 'org1',
+            'phone': '+12815551234',
+            'name': 'John Doe',
+            'issue': 'Contract review',
+            'language': 'en',
+        }), None)
+
+    body = json.loads(result['body'])
+    assert result['statusCode'] == 200
+    assert body['success'] is True
+    assert body['contact_id'] is not None
+    assert body['intake_id'] is not None
+
+
+def test_book_appointment_writes_db_even_if_clio_fails():
+    with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function.get_connection') as mock_get_conn, \
+         patch('lambda_function.requests.post') as mock_post:
+        mock_post.side_effect = Exception("Clio timeout")
+
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        org = {'clio_access_token': 'token123'}
+        mock_cursor.fetchone.side_effect = [org, None]
+        conn = MagicMock()
+        conn.cursor.return_value = mock_cursor
+        mock_get_conn.return_value = conn
+
+        from lambda_function import lambda_handler
+        result = lambda_handler(_event('POST', '/firmos/voice/appointment', body={
+            'org_id': 'org1',
+            'contact_id': 'c1',
+            'start_at': '2026-05-15T10:00:00Z',
+            'end_at': '2026-05-15T11:00:00Z',
+        }), None)
+
+    body = json.loads(result['body'])
+    assert result['statusCode'] == 200
+    assert body['confirmed'] is True
+    assert conn.commit.called
+
+
+def test_route_not_found_returns_404():
+    with patch('lambda_function._verify_secret', return_value=True), \
+         patch('lambda_function.get_connection'):
+        from lambda_function import lambda_handler
+        result = lambda_handler(_event('GET', '/firmos/voice/invalid'), None)
+
+    assert result['statusCode'] == 404
