@@ -13,11 +13,18 @@ logger.setLevel(logging.INFO)
 REGION = 'us-east-2'
 
 
+_secret_cache: dict = {}
+
+ALLOWED_FLAG_COLS = {'reminder_sent_48h', 'reminder_sent_24h'}
+
+
 def _invoke_send(secret_arn: str, org_id: str, conv_id: str, to_phone: str, body: str) -> None:
-    secret = json.loads(
-        boto3.client('secretsmanager', region_name=REGION)
-        .get_secret_value(SecretId=secret_arn)['SecretString']
-    )
+    if secret_arn not in _secret_cache:
+        _secret_cache[secret_arn] = json.loads(
+            boto3.client('secretsmanager', region_name=REGION)
+            .get_secret_value(SecretId=secret_arn)['SecretString']
+        )
+    secret = _secret_cache[secret_arn]
     boto3.client('lambda', region_name=REGION).invoke(
         FunctionName='firmos-twilio-send',
         InvocationType='Event',
@@ -32,6 +39,8 @@ def _invoke_send(secret_arn: str, org_id: str, conv_id: str, to_phone: str, body
 
 
 def _send_reminders(conn, window_start, window_end, flag_col: str, hours: int) -> tuple[int, int]:
+    if flag_col not in ALLOWED_FLAG_COLS:
+        raise ValueError(f"Invalid flag_col: {flag_col}")
     sent = 0
     errors = 0
     with conn.cursor() as cur:
