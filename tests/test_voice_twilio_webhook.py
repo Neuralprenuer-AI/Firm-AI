@@ -71,6 +71,27 @@ def test_returns_error_twiml_when_org_not_found():
     assert 'technical difficulties' in result['body']
 
 
+def test_returns_error_twiml_when_agent_not_provisioned():
+    with patch('lambda_function.get_connection') as mock_conn, \
+         patch('lambda_function._verify_twilio_signature', return_value=True):
+
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.fetchone.return_value = {
+            'org_id': 'a1b2c3d4-0002-0002-0002-000000000002',
+            'elevenlabs_agent_id': None,
+            'secret_arn': 'arn:test',
+        }
+        mock_conn.return_value.cursor.return_value = mock_cursor
+
+        from lambda_function import lambda_handler
+        result = lambda_handler(_make_twilio_event(), None)
+
+    assert result['statusCode'] == 200
+    assert 'technical difficulties' in result['body']
+
+
 def test_rejects_invalid_twilio_signature():
     with patch('lambda_function.get_connection') as mock_conn, \
          patch('lambda_function._get_secret', return_value={'twilio_auth_token': 'real_token'}), \
