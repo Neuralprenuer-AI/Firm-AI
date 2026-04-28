@@ -1081,4 +1081,42 @@ def lambda_handler(event, context):
                   {'reminder_id': rid, 'status': new_status})
         return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
 
+    # POST /firmos/onboard/firm — super_admin: provision a new law firm
+    if path == '/firmos/onboard/firm' and method == 'POST':
+        if role != 'super_admin':
+            return _resp(403, {'error': 'super_admin required'})
+        required_onboard = ['name', 'practice_area', 'partner_email', 'partner_name', 'timezone',
+                            'emergency_contact_number', 'agent_display_name',
+                            'monthly_sms_budget', 'monthly_token_budget']
+        missing_onboard = [f for f in required_onboard if not body.get(f)]
+        if missing_onboard:
+            return _resp(400, {'error': f'missing required fields: {missing_onboard}'})
+        valid_areas = {'immigration', 'family_law', 'criminal_defense', 'personal_injury'}
+        if body.get('practice_area') not in valid_areas:
+            return _resp(400, {'error': f"practice_area must be one of: {sorted(valid_areas)}"})
+        lam = boto3.client('lambda', region_name='us-east-2')
+        setup_payload = {
+            'is_super_admin': True,
+            'firm_name': body['name'],
+            'practice_area': body['practice_area'],
+            'partner_email': body['partner_email'],
+            'partner_name': body['partner_name'],
+            'timezone': body['timezone'],
+            'emergency_contact_number': body['emergency_contact_number'],
+            'agent_display_name': body['agent_display_name'],
+            'monthly_sms_budget': int(body.get('monthly_sms_budget', 500)),
+            'monthly_token_budget': int(body.get('monthly_token_budget', 100000)),
+            'city': body.get('city', ''),
+            'state': body.get('state', ''),
+            'website': body.get('website', ''),
+        }
+        resp = lam.invoke(FunctionName='firmos-org-setup', InvocationType='RequestResponse', Payload=json.dumps(setup_payload).encode())
+        result = json.loads(resp['Payload'].read())
+        if resp.get('FunctionError') or result.get('statusCode', 200) >= 400:
+            body_result = json.loads(result.get('body', '{}')) if isinstance(result.get('body'), str) else result
+            return _resp(500, {'error': body_result.get('error', 'org setup failed'), 'detail': body_result.get('message', '')})
+        result_body = json.loads(result.get('body', '{}')) if isinstance(result.get('body'), str) else result
+        log_audit(conn, result_body.get('org_id', 'unknown'), claims.get('sub', 'system'), 'org.created', {'firm_name': body['name'], 'practice_area': body['practice_area']})
+        return _resp(201, result_body)
+
     return _resp(404, {'error': 'route not found'})
