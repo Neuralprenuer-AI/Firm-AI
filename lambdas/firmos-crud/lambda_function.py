@@ -1112,11 +1112,15 @@ def lambda_handler(event, context):
         }
         resp = lam.invoke(FunctionName='firmos-org-setup', InvocationType='RequestResponse', Payload=json.dumps(setup_payload).encode())
         result = json.loads(resp['Payload'].read())
-        if resp.get('FunctionError') or result.get('statusCode', 200) >= 400:
+        if resp.get('FunctionError') or result.get('errorMessage') or result.get('statusCode', 200) >= 400:
             body_result = json.loads(result.get('body', '{}')) if isinstance(result.get('body'), str) else result
             return _resp(500, {'error': body_result.get('error', 'org setup failed'), 'detail': body_result.get('message', '')})
         result_body = json.loads(result.get('body', '{}')) if isinstance(result.get('body'), str) else result
-        log_audit(conn, result_body.get('org_id', 'unknown'), claims.get('sub', 'system'), 'org.created', {'firm_name': body['name'], 'practice_area': body['practice_area']})
+        org_id_created = result_body.get('org_id')
+        if not org_id_created:
+            logger.error("firmos-org-setup succeeded but returned no org_id: %s", result_body)
+            return _resp(500, {'error': 'org setup completed but org_id missing from response'})
+        log_audit(conn, org_id_created, claims.get('sub', 'system'), 'org.created', {'name': body['name'], 'practice_area': body['practice_area']})
         return _resp(201, result_body)
 
     return _resp(404, {'error': 'route not found'})
