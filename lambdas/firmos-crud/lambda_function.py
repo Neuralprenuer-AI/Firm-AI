@@ -765,6 +765,8 @@ def lambda_handler(event, context):
     if path.startswith('/firmos/conversations/') and method == 'GET' and not path.endswith('/messages'):
         parts = path.split('/')
         conv_id = parts[3] if len(parts) >= 4 else None
+        if not conv_id or not _valid_uuid(conv_id):
+            return _resp(400, {'error': 'invalid conversation_id'})
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT cv.*, c.name AS contact_name, c.phone AS contact_phone "
@@ -1015,17 +1017,24 @@ def lambda_handler(event, context):
             Payload=json.dumps(payload).encode(),
         )
         result = json.loads(resp['Payload'].read())
-        if result.get('error'):
-            return _resp(500, {'error': result['error']})
+        if resp.get('FunctionError') or result.get('error') or result.get('errorMessage'):
+            err_msg = result.get('error') or result.get('errorMessage') or 'twilio_send_failed'
+            logger.error("firmos-twilio-send error: %s", err_msg)
+            return _resp(500, {'error': err_msg})
         log_audit(conn, conv_org_id, claims.get('sub', 'system'), 'conversation.manual_reply',
                   {'conversation_id': conv_id, 'length': len(message_text)})
         return _resp(200, {'sent': True, 'twilio_sid': result.get('twilio_message_sid')})
 
     # GET /firmos/reminders — list callback reminders
     if path == '/firmos/reminders' and method == 'GET':
-        if role != 'firm_admin':
+        if role not in ('super_admin', 'firm_admin'):
             return _resp(403, {'error': 'forbidden'})
+        org_id = caller_org_id if role == 'firm_admin' else (event.get('queryStringParameters') or {}).get('org_id')
+        if not org_id:
+            return _resp(400, {'error': 'org_id required for super_admin'})
         status_filter = (event.get('queryStringParameters') or {}).get('status', 'pending')
+        if status_filter not in ('pending', 'completed', 'dismissed'):
+            return _resp(400, {'error': "status must be 'pending', 'completed', or 'dismissed'"})
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT reminder_id, contact_id, conversation_id, contact_name, "
@@ -1033,7 +1042,7 @@ def lambda_handler(event, context):
                 "FROM firm_os.callback_reminders "
                 "WHERE org_id = %s AND status = %s "
                 "ORDER BY created_at DESC",
-                (caller_org_id, status_filter)
+                (org_id, status_filter)
             )
             rows = cur.fetchall()
         return _resp(200, [dict(r) for r in rows])
