@@ -1,12 +1,16 @@
 import boto3
 import json
+import logging
 import os
 import sys
 import re
 import uuid
 import jwt as pyjwt
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 sys.path.insert(0, '/opt/python')
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
 
@@ -15,6 +19,30 @@ def _valid_uuid(v):
 
 from shared_auth import auth_context as _jwks_auth_context, get_org_id, get_role
 from shared_db import get_connection, assert_org_access, log_audit
+
+
+def _compute_quality(intake: dict) -> tuple:
+    """Score an intake 0-100. 25pts per: has_name, has_issue, has_summary, has_language."""
+    data = intake.get('data') or {}
+    fields = intake.get('fields') or {}
+    checks = {
+        'has_name': bool(
+            intake.get('full_name') or
+            fields.get('full_name') or
+            data.get('name')
+        ),
+        'has_issue': bool(
+            intake.get('brief_description') or
+            fields.get('brief_description') or
+            data.get('issue') or
+            data.get('legal_issue')
+        ),
+        'has_summary': bool(data.get('summary')),
+        'has_language': bool(data.get('language') or data.get('preferred_language')),
+    }
+    missing = [k for k, v in checks.items() if not v]
+    score = (4 - len(missing)) * 25
+    return score, missing
 
 
 def _get_secret():
@@ -123,7 +151,7 @@ def lambda_handler(event, context):
                 "FROM firm_os.contacts c "
                 "LEFT JOIN firm_os.conversations cv ON c.contact_id = cv.contact_id "
                 "LEFT JOIN firm_os.messages m ON cv.conversation_id = m.conversation_id "
-                "WHERE c.org_id = %s "
+                "WHERE c.org_id = %s AND c.phone NOT LIKE 'voice-anon-%%' "
                 "GROUP BY c.contact_id "
                 "ORDER BY MAX(m.created_at) DESC NULLS LAST",
                 (org_id,)
@@ -139,14 +167,21 @@ def lambda_handler(event, context):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT cv.conversation_id, cv.org_id, cv.contact_id, cv.state, cv.turn_count, "
-                "cv.created_at, cv.updated_at, "
-                "c.name AS contact_name, c.phone AS contact_phone, "
+                "cv.channel, cv.created_at, cv.updated_at, "
+                "COALESCE("
+                "  NULLIF(ir.data->>'name', ''), "
+                "  CASE WHEN c.name LIKE 'voice-anon-%%' THEN NULL ELSE c.name END, "
+                "  c.name"
+                ") AS contact_name, "
+                "c.phone AS contact_phone, "
                 "(SELECT m.body FROM firm_os.messages m "
                 " WHERE m.conversation_id = cv.conversation_id "
                 " ORDER BY m.created_at DESC LIMIT 1) AS last_message_preview "
                 "FROM firm_os.conversations cv "
                 "JOIN firm_os.contacts c ON cv.contact_id = c.contact_id "
+                "LEFT JOIN firm_os.intake_records ir ON ir.conversation_id = cv.conversation_id "
                 "WHERE cv.org_id = %s "
+                "AND NOT (cv.channel = 'voice' AND cv.turn_count = 0) "
                 "ORDER BY cv.updated_at DESC",
                 (org_id,)
             )
@@ -239,8 +274,8 @@ def lambda_handler(event, context):
             )
             chart = [dict(r) for r in cur.fetchall()]
             cur.execute(
-                "SELECT e.escalation_id, c.name AS contact_name, e.triggered_keyword AS keyword, "
-                "e.created_at AS time, e.status "
+                "SELECT e.escalation_id, c.name AS contact_name, c.phone, e.triggered_keyword AS keyword, "
+                "e.created_at, e.status "
                 "FROM firm_os.escalations e "
                 "JOIN firm_os.contacts c ON e.contact_id = c.contact_id "
                 "WHERE e.org_id = %s AND e.status = 'open' "
@@ -248,12 +283,35 @@ def lambda_handler(event, context):
                 (org_id,)
             )
             recent_escs = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT COUNT(*) FROM firm_os.conversations "
+                "WHERE org_id = %s AND channel = 'voice' AND created_at >= CURRENT_DATE",
+                (org_id,)
+            )
+            voice_today = cur.fetchone()['count']
+            cur.execute(
+                "SELECT COUNT(*) FROM firm_os.conversations WHERE org_id = %s AND channel = 'voice'",
+                (org_id,)
+            )
+            voice_total = cur.fetchone()['count']
+            cur.execute(
+                "SELECT ce.summary, ce.start_at::text, c.name AS contact_name "
+                "FROM firm_os.clio_calendar_entries ce "
+                "LEFT JOIN firm_os.contacts c ON ce.contact_id = c.contact_id "
+                "WHERE ce.org_id = %s AND ce.start_at > NOW() "
+                "ORDER BY ce.start_at ASC LIMIT 5",
+                (org_id,)
+            )
+            upcoming = [dict(r) for r in cur.fetchall()]
         return _resp(200, {
             'sms_sent_today': sms_today,
             'active_conversations': active_convs,
             'open_escalations': open_escs,
             'contacts_this_week': new_contacts,
+            'voice_calls_today': voice_today,
+            'voice_calls_total': voice_total,
             'recent_escalations': recent_escs,
+            'upcoming_appointments': upcoming,
             'conversation_volume': [{'date': str(r['day']), 'count': r['count']} for r in chart]
         })
 
@@ -482,11 +540,11 @@ def lambda_handler(event, context):
 
     # GET /firmos/settings/crm
     if path == '/firmos/settings/crm' and method == 'GET':
-        if role != 'firm_admin':
+        if role not in ('firm_admin', 'super_admin', 'owner'):
             return _resp(403, {'error': 'firm_admin required'})
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT crm_platform, clio_access_token, clio_token_expires_at, updated_at "
+                "SELECT name, crm_platform, clio_access_token "
                 "FROM firm_os.organizations WHERE org_id = %s",
                 (caller_org_id,)
             )
@@ -495,10 +553,22 @@ def lambda_handler(event, context):
             return _resp(404, {'error': 'not found'})
         r = dict(row)
         connected = bool(r.get('crm_platform') and r.get('clio_access_token'))
+        last_synced_at = None
+        if connected:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT MAX(last_synced_at)::text AS last_synced_at "
+                    "FROM firm_os.case_status_cache WHERE org_id = %s",
+                    (caller_org_id,)
+                )
+                sync_row = cur.fetchone()
+            if sync_row:
+                last_synced_at = sync_row.get('last_synced_at')
         return _resp(200, {
             'connected': connected,
             'platform': r.get('crm_platform'),
-            'connected_at': r.get('clio_token_expires_at') or r.get('updated_at')
+            'firm_name': r.get('name'),
+            'last_synced_at': last_synced_at,
         })
 
     # DELETE /firmos/settings/crm
@@ -528,21 +598,121 @@ def lambda_handler(event, context):
             logger.error("Failed to load Clio OAuth credentials: %s", exc)
             return _resp(500, {'error': 'server_error'})
         nonce = str(uuid.uuid4())
-        state = json.dumps({'org_id': caller_org_id, 'nonce': nonce})
+        state = json.dumps({'org_id': caller_org_id, 'nonce': nonce}, separators=(',', ':'))
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE firm_os.organizations SET clio_oauth_state = %s WHERE org_id = %s",
                 (nonce, caller_org_id),
             )
         conn.commit()
-        params = urlencode({
-            'response_type': 'code',
-            'client_id': clio_client_id,
-            'redirect_uri': 'https://kezjhodcig.execute-api.us-east-2.amazonaws.com/prod/firmos/clio/callback',
-            'state': state,
-            'redirect_on_decline': 'true',
+        redirect_uri = 'https://kezjhodcig.execute-api.us-east-2.amazonaws.com/prod/firmos/clio/callback'
+        oauth_url = (
+            f"https://app.clio.com/oauth/authorize"
+            f"?response_type=code"
+            f"&client_id={clio_client_id}"
+            f"&redirect_uri={quote(redirect_uri, safe='')}"
+            f"&state={quote(state, safe='')}"
+            f"&redirect_on_decline=true"
+        )
+        return _resp(200, {'url': oauth_url})
+
+    # GET /firmos/contacts/{id}/profile — full client profile
+    if path.startswith('/firmos/contacts/') and path.endswith('/profile') and method == 'GET':
+        parts = path.split('/')
+        contact_id = parts[3] if len(parts) >= 5 else None
+        if not contact_id or not _valid_uuid(contact_id):
+            return _resp(400, {'error': 'invalid contact_id'})
+        # Org-scope check
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM firm_os.contacts WHERE contact_id = %s", (contact_id,))
+            contact = cur.fetchone()
+        if not contact:
+            return _resp(404, {'error': 'not found'})
+        if role == 'firm_admin':
+            try:
+                assert_org_access(caller_org_id, str(contact['org_id']))
+            except PermissionError:
+                return _resp(403, {'error': 'forbidden'})
+        org_id = str(contact['org_id'])
+
+        # Matters / case status
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT clio_matter_id, matter_display_number, matter_status, "
+                "responsible_attorney_name, open_date, pending_date, notes_text, last_synced_at "
+                "FROM firm_os.case_status_cache "
+                "WHERE org_id = %s AND contact_id = %s ORDER BY last_synced_at DESC",
+                (org_id, contact_id)
+            )
+            matters = [dict(r) for r in cur.fetchall()]
+
+        # Clio notes
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT clio_note_id, subject, detail, note_date "
+                "FROM firm_os.clio_notes "
+                "WHERE org_id = %s AND contact_id = %s ORDER BY note_date DESC NULLS LAST LIMIT 20",
+                (org_id, contact_id)
+            )
+            notes = [dict(r) for r in cur.fetchall()]
+
+        # Calendar entries (upcoming first, then past)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT clio_entry_id, summary, start_at, end_at, all_day "
+                "FROM firm_os.clio_calendar_entries "
+                "WHERE org_id = %s AND contact_id = %s "
+                "ORDER BY start_at DESC LIMIT 20",
+                (org_id, contact_id)
+            )
+            calendar = [dict(r) for r in cur.fetchall()]
+
+        # Communications
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT clio_comm_id, comm_type, subject, body, received_at "
+                "FROM firm_os.clio_communications "
+                "WHERE org_id = %s AND contact_id = %s ORDER BY received_at DESC NULLS LAST LIMIT 20",
+                (org_id, contact_id)
+            )
+            communications = [dict(r) for r in cur.fetchall()]
+
+        # All intake records for this contact — newest first
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT intake_id, data, fields, full_name, brief_description, "
+                "crm_pushed, crm_matter_id, created_at "
+                "FROM firm_os.intake_records "
+                "WHERE org_id = %s AND contact_id = %s ORDER BY created_at DESC",
+                (org_id, contact_id)
+            )
+            intakes = [dict(r) for r in cur.fetchall()]
+        for intake in intakes:
+            score, flags = _compute_quality(intake)
+            intake['quality_score'] = score
+            intake['quality_flags'] = flags
+
+        # AI Conversations
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT conversation_id, channel, state, turn_count, created_at "
+                "FROM firm_os.conversations "
+                "WHERE org_id = %s AND contact_id = %s "
+                "AND NOT (channel = 'voice' AND turn_count = 0) "
+                "ORDER BY created_at DESC LIMIT 20",
+                (org_id, contact_id)
+            )
+            conversations = [dict(r) for r in cur.fetchall()]
+
+        return _resp(200, {
+            'contact': dict(contact),
+            'matters': matters,
+            'notes': notes,
+            'calendar': calendar,
+            'communications': communications,
+            'intakes': intakes,
+            'conversations': conversations,
         })
-        return _resp(200, {'url': f'https://app.clio.com/oauth/authorize?{params}'})
 
     # GET /firmos/contacts/{contact_id}/conversations
     if path.startswith('/firmos/contacts/') and method == 'GET':
@@ -592,8 +762,9 @@ def lambda_handler(event, context):
             return _resp(200, [dict(r) for r in rows])
 
     # GET /firmos/conversations/{id} — single conversation
-    if path.startswith('/firmos/conversations/') and method == 'GET' and params.get('id') and not path.endswith('/messages'):
-        conv_id = params['id']
+    if path.startswith('/firmos/conversations/') and method == 'GET' and not path.endswith('/messages'):
+        parts = path.split('/')
+        conv_id = parts[3] if len(parts) >= 4 else None
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT cv.*, c.name AS contact_name, c.phone AS contact_phone "
@@ -614,7 +785,8 @@ def lambda_handler(event, context):
 
     # PATCH /firmos/conversations/{id}/close
     if path.startswith('/firmos/conversations/') and path.endswith('/close') and method == 'PATCH':
-        conv_id = params.get('id')
+        parts = path.split('/')
+        conv_id = parts[3] if len(parts) >= 5 else None
         if not _valid_uuid(conv_id):
             return _resp(400, {'error': 'invalid conversation id'})
         with conn.cursor() as cur:
@@ -653,9 +825,91 @@ def lambda_handler(event, context):
             rows = cur.fetchall()
         return _resp(200, [dict(r) for r in rows])
 
+    # GET /firmos/summaries — all AI intake summaries with contact info
+    if path == '/firmos/summaries' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'firm_admin required'})
+        channel_filter = (event.get('queryStringParameters') or {}).get('channel')
+        with conn.cursor() as cur:
+            base_q = (
+                "SELECT ir.intake_id, ir.contact_id, ir.conversation_id, "
+                "ir.data, ir.fields, ir.full_name, ir.brief_description, "
+                "ir.crm_pushed, ir.crm_matter_id, ir.created_at, "
+                "COALESCE("
+                "  ir.full_name, "
+                "  ir.fields->>'full_name', "
+                "  ir.data->>'name', "
+                "  CASE WHEN c.name LIKE 'voice-anon-%%' THEN NULL ELSE c.name END"
+                ") AS contact_name, "
+                "c.phone AS contact_phone, "
+                "COALESCE(ir.data->>'channel', cv.channel, 'sms') AS channel "
+                "FROM firm_os.intake_records ir "
+                "LEFT JOIN firm_os.contacts c ON ir.contact_id = c.contact_id "
+                "LEFT JOIN firm_os.conversations cv ON ir.conversation_id = cv.conversation_id "
+                "WHERE ir.org_id = %s "
+            )
+            if channel_filter in ('voice', 'sms'):
+                cur.execute(
+                    base_q + "AND COALESCE(ir.data->>'channel', cv.channel, 'sms') = %s "
+                    "ORDER BY ir.created_at DESC LIMIT 200",
+                    (caller_org_id, channel_filter)
+                )
+            else:
+                cur.execute(
+                    base_q + "ORDER BY ir.created_at DESC LIMIT 200",
+                    (caller_org_id,)
+                )
+            rows = cur.fetchall()
+        results = []
+        for r in rows:
+            row_dict = dict(r)
+            score, flags = _compute_quality(row_dict)
+            row_dict['quality_score'] = score
+            row_dict['quality_flags'] = flags
+            results.append(row_dict)
+        return _resp(200, results)
+
     # GET /firmos/calls
     if path == '/firmos/calls' and method == 'GET':
-        return _resp(200, [])
+        org_id = caller_org_id if role == 'firm_admin' else (event.get('queryStringParameters') or {}).get('org_id')
+        if not org_id:
+            return _resp(400, {'error': 'org_id required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ir.intake_id AS call_id, ir.created_at, "
+                "c.name AS contact_name, c.phone AS contact_phone, "
+                "ir.data->>'issue' AS issue, "
+                "ir.data->>'language' AS language, "
+                "ir.data->>'channel' AS channel, "
+                "ir.data->>'summary' AS summary, "
+                "cv.state, cv.elevenlabs_conversation_id "
+                "FROM firm_os.intake_records ir "
+                "LEFT JOIN firm_os.contacts c ON ir.contact_id = c.contact_id "
+                "LEFT JOIN firm_os.conversations cv ON ir.conversation_id = cv.conversation_id "
+                "WHERE ir.org_id = %s AND (ir.data->>'channel' = 'voice' OR cv.channel = 'voice') "
+                "ORDER BY ir.created_at DESC LIMIT 100",
+                (org_id,),
+            )
+            rows = cur.fetchall()
+        return _resp(200, [dict(r) for r in rows])
+
+    # GET /firmos/calendar
+    if path == '/firmos/calendar' and method == 'GET':
+        org_id = caller_org_id if role == 'firm_admin' else (event.get('queryStringParameters') or {}).get('org_id')
+        if not org_id:
+            return _resp(400, {'error': 'org_id required'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ce.clio_entry_id, ce.summary, ce.start_at, ce.end_at, ce.all_day, "
+                "c.name AS contact_name, c.phone AS contact_phone "
+                "FROM firm_os.clio_calendar_entries ce "
+                "LEFT JOIN firm_os.contacts c ON ce.contact_id = c.contact_id "
+                "WHERE ce.org_id = %s AND ce.start_at > NOW() "
+                "ORDER BY ce.start_at ASC LIMIT 50",
+                (org_id,)
+            )
+            rows = cur.fetchall()
+        return _resp(200, [dict(r) for r in rows])
 
     # GET /firmos/audits — daily digest stub
     if path == '/firmos/audits' and method == 'GET':
@@ -708,5 +962,114 @@ def lambda_handler(event, context):
             'language': {'default_language': r.get('default_language') or 'en', 'spanish_enabled': False},
             'current_step': 0
         })
+
+    # POST /firmos/conversations/{id}/reply — send SMS from dashboard
+    if path.startswith('/firmos/conversations/') and path.endswith('/reply') and method == 'POST':
+        parts = path.split('/')
+        conv_id = parts[3] if len(parts) >= 5 else None
+        if not conv_id or not _valid_uuid(conv_id):
+            return _resp(400, {'error': 'invalid conversation_id'})
+        message_text = body.get('message', '').strip()
+        if not message_text:
+            return _resp(400, {'error': 'message is required'})
+        if len(message_text) > 1600:
+            return _resp(400, {'error': 'message too long (max 1600 chars)'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cv.org_id, cv.contact_id, c.phone AS contact_phone "
+                "FROM firm_os.conversations cv "
+                "JOIN firm_os.contacts c ON cv.contact_id = c.contact_id "
+                "WHERE cv.conversation_id = %s",
+                (conv_id,)
+            )
+            conv_row = cur.fetchone()
+        if not conv_row:
+            return _resp(404, {'error': 'conversation not found'})
+        if role == 'firm_admin':
+            try:
+                assert_org_access(caller_org_id, str(conv_row['org_id']))
+            except PermissionError:
+                return _resp(403, {'error': 'forbidden'})
+        conv_org_id = str(conv_row['org_id'])
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT secret_arn FROM firm_os.organizations WHERE org_id = %s",
+                (conv_org_id,)
+            )
+            org_row = cur.fetchone()
+        if not org_row or not org_row.get('secret_arn'):
+            return _resp(500, {'error': 'org secret not configured'})
+        sm = boto3.client('secretsmanager', region_name='us-east-2')
+        secret = json.loads(sm.get_secret_value(SecretId=org_row['secret_arn'])['SecretString'])
+        lam = boto3.client('lambda', region_name='us-east-2')
+        payload = {
+            'org_id': conv_org_id,
+            'to_phone': str(conv_row['contact_phone']),
+            'body': message_text,
+            'subaccount_token': secret['twilio_auth_token'],
+            'conversation_id': conv_id,
+        }
+        resp = lam.invoke(
+            FunctionName='firmos-twilio-send',
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload).encode(),
+        )
+        result = json.loads(resp['Payload'].read())
+        if result.get('error'):
+            return _resp(500, {'error': result['error']})
+        log_audit(conn, conv_org_id, claims.get('sub', 'system'), 'conversation.manual_reply',
+                  {'conversation_id': conv_id, 'length': len(message_text)})
+        return _resp(200, {'sent': True, 'twilio_sid': result.get('twilio_message_sid')})
+
+    # GET /firmos/reminders — list callback reminders
+    if path == '/firmos/reminders' and method == 'GET':
+        if role != 'firm_admin':
+            return _resp(403, {'error': 'forbidden'})
+        status_filter = (event.get('queryStringParameters') or {}).get('status', 'pending')
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reminder_id, contact_id, conversation_id, contact_name, "
+                "contact_phone, note, status, created_at, completed_at "
+                "FROM firm_os.callback_reminders "
+                "WHERE org_id = %s AND status = %s "
+                "ORDER BY created_at DESC",
+                (caller_org_id, status_filter)
+            )
+            rows = cur.fetchall()
+        return _resp(200, [dict(r) for r in rows])
+
+    # PATCH /firmos/reminders/{reminder_id} — mark completed or dismissed
+    if path.startswith('/firmos/reminders/') and method == 'PATCH' and params.get('reminder_id'):
+        rid = params['reminder_id']
+        if not _valid_uuid(rid):
+            return _resp(400, {'error': 'invalid reminder_id'})
+        new_status = body.get('status')
+        if new_status not in ('completed', 'dismissed'):
+            return _resp(400, {'error': "status must be 'completed' or 'dismissed'"})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT org_id FROM firm_os.callback_reminders WHERE reminder_id = %s",
+                (rid,)
+            )
+            rem = cur.fetchone()
+        if not rem:
+            return _resp(404, {'error': 'not found'})
+        if role == 'firm_admin':
+            try:
+                assert_org_access(caller_org_id, str(rem['org_id']))
+            except PermissionError:
+                return _resp(403, {'error': 'forbidden'})
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE firm_os.callback_reminders "
+                "SET status = %s, completed_at = NOW() "
+                "WHERE reminder_id = %s RETURNING *",
+                (new_status, rid)
+            )
+            row = cur.fetchone()
+        conn.commit()
+        log_audit(conn, caller_org_id, claims.get('sub', 'system'), 'reminder.updated',
+                  {'reminder_id': rid, 'status': new_status})
+        return _resp(200, dict(row)) if row else _resp(404, {'error': 'not found'})
 
     return _resp(404, {'error': 'route not found'})
