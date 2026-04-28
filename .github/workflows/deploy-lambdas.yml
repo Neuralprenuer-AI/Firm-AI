@@ -1,0 +1,46 @@
+name: Deploy Changed Lambdas
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lambdas/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::006619321854:role/github-actions-firmos
+          aws-region: us-east-2
+
+      - name: Detect changed lambdas
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- lambdas/ | grep '/' | cut -d'/' -f2 | sort -u)
+          echo "lambdas=$CHANGED" >> $GITHUB_OUTPUT
+          echo "Changed: $CHANGED"
+
+      - name: Deploy each changed lambda
+        run: |
+          for LAMBDA in ${{ steps.changed.outputs.lambdas }}; do
+            DIR="lambdas/$LAMBDA"
+            if [ -f "$DIR/lambda_function.py" ]; then
+              echo "Deploying $LAMBDA..."
+              cd "$DIR"
+              zip -r /tmp/${LAMBDA}.zip lambda_function.py
+              aws lambda update-function-code --function-name "$LAMBDA" --zip-file "fileb:///tmp/${LAMBDA}.zip" --region us-east-2
+              echo "$LAMBDA deployed."
+              cd "$GITHUB_WORKSPACE"
+            fi
+          done
